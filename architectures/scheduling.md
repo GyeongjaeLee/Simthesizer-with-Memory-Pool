@@ -27,7 +27,8 @@ batch shape. A `Router` owns whole-request placement across instances.
   order until `max_batch`, `max_num_batched_tokens`, or memory runs out. Each
   takes its remaining known tokens up to the remaining budget, and at least one
   token, which is a decode step.
-- Usable memory per GPU is `device_mem × device_mem_utilization`. It holds weights,
+- Usable memory per GPU is `device_mem × device_mem_utilization` minus
+  `reserved_device_bytes` (activation and graph workspace). It holds weights,
   prefix-cache blocks, block-rounded private KV, and per-request state such as
   Mamba SSM state. A request is admitted only if its footprint after the
   iteration fits.

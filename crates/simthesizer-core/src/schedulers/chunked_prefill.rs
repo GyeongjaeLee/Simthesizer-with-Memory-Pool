@@ -18,6 +18,9 @@ pub struct ChunkedPrefillScheduler {
     max_num_batched_tokens: u32,
     device_mem: u64,
     device_mem_utilization: f64,
+    /// Per-GPU workspace (activations, graphs, communication buffers).
+    #[serde(default)]
+    reserved_device_bytes: u64,
     enable_prefix_caching: bool,
 
     #[serde(skip_deserializing, default)]
@@ -242,8 +245,10 @@ impl Scheduler for ChunkedPrefillScheduler {
         self.model_weight_bytes_per_device = model_weight_bytes_per_device;
         self.kv_bytes_per_request_per_device = kv_bytes_per_request_per_device;
         self.kv_bytes_per_token_per_device = kv_bytes_per_token_per_device;
-        self.usable_device_mem =
-            (self.device_mem as f64 * self.device_mem_utilization).floor() as u64;
+        self.usable_device_mem = ((self.device_mem as f64 * self.device_mem_utilization).floor()
+            as u64)
+            .checked_sub(self.reserved_device_bytes)
+            .ok_or_else(|| anyhow!("reserved_device_bytes exceeds usable device memory"))?;
         self.effective_max_batch = self
             .max_batch
             .checked_mul(parallel.ep as usize)
@@ -498,6 +503,22 @@ mod tests {
                 "generation_tokens_total": generated,
             })
         );
+    }
+
+    #[test]
+    fn reserved_workspace_reduces_usable_memory() {
+        let mut scheduler = scheduler(8, false);
+        scheduler.device_mem = 16;
+        scheduler.reserved_device_bytes = 4;
+        let parallel = ParallelStrategy {
+            tp: 1,
+            pp: 1,
+            ep: 1,
+        };
+        scheduler.init(4, 0, 1, parallel).unwrap();
+        assert_eq!(scheduler.usable_device_mem, 12);
+        scheduler.reserved_device_bytes = 17;
+        assert!(scheduler.init(4, 0, 1, parallel).is_err());
     }
 
     #[test]

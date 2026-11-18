@@ -39,6 +39,10 @@ and no prefix caching. Copied workloads retain their source token IDs: ShareGPT'
 IDs exceed Llama's vocabulary, and agentic traces need a DAG-capable replay runner.
 They are not interchangeable baseline inputs.
 
+`4xh200--minimax_m2_7--realistic` uses CUDA graphs, TP4, FP8 KV and prefix
+caching from a measured forward-pass table; its iteration-level evidence is in
+[`experiments/fpm-validation`](../experiments/fpm-validation/guide.md).
+
 ## Runners
 
 - **Simthesizer** is the CLI.

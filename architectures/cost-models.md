@@ -50,6 +50,23 @@ fail the run. Forced MoE routing is not yet supported by this loader.
 `examples/data/<device>/`. Each scenario names its profile explicitly; model and
 hardware must match. The simulator does not load CSV profiles.
 
+## Forward-Pass Tables
+
+`scripts/import_fpm.py` converts one deployment's FPM Parquet
+(`iteration_totals_balanced_v1`) into JSON: decode rows (requests, total KV,
+latency) and prefill rows (requests, new tokens, cached KV, latency) of balanced
+batches. The `forward_pass` runner rejects a table measured at another TP or
+with expert parallelism.
+
+An iteration whose requests all compute one token uses decode (requests, Σ kv).
+Any other batch uses prefill (Σ q, Σ q·(q/2 + kv)); measured rows project to the
+same coordinates. One axis carries token-wise work and the other causal
+attention, so unequal lengths, more requests than measured and decode tokens in
+mixed batches need no separate rule. Lookups interpolate linearly, clamp below
+and extrapolate above without decreasing cost; extrapolated and mixed lookups are
+counted. Tables measured by a serving engine include its graphs, fusion and
+collectives, but not idle time or KV transfers.
+
 ## Flow Network
 
 - Owners register devices and directed links (bandwidth, latency) during

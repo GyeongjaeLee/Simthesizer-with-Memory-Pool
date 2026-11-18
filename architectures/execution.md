@@ -21,7 +21,7 @@ and network nodes.
 - A model reports weight bytes per device, KV bytes per token, and per-request
   state bytes. One scheduler spanning several EP ranks averages request KV/state
   costs across ranks; resident weights remain the full per-device amount.
-- Built-ins: `llama3_1`, `qwen3_moe`, `nemotron_h`.
+- Built-ins: `llama3_1`, `qwen3_moe`, `minimax_m2`, `nemotron_h`.
 
 Llama TP partitions query heads evenly. KV heads partition when there are at
 least as many heads as ranks; otherwise each rank holds one replicated KV head.
@@ -40,6 +40,9 @@ in its network simulator, and its compute and network simulators.
 - **`moe_ep`** is expert parallelism with `tp = 1` over a full mesh. Each MoE
   layer becomes routing, an all-to-all dispatch, one compute node per rank, a
   barrier, and an all-to-all combine. It rejects all-reduce markers.
+- **`forward_pass`** prices each TP iteration once from a measured forward-pass
+  table. It ignores the layer plan; the model supplies only memory. Collectives,
+  kernel fusion and graph replay are inside the measurement.
 
 Pipeline parallelism and combined TP×EP are not modeled.
 

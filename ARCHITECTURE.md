@@ -8,7 +8,8 @@ output is per-token timing for every LLM call, in the same DAG shape.
 
 The implemented product is a Rust CLI that reads one scenario config and one
 canonical workload JSONL and writes one result JSONL. Compute cost comes from
-per-layer latency tables profiled with vLLM on real hardware; communication
+per-layer latency tables profiled with vLLM on real hardware or whole-iteration
+forward-pass tables measured on a serving deployment; communication
 cost comes from a flow-level network model. `scripts/baseline.py` replays
 single-call workloads on vLLM for comparison. `scripts/compare.py` measures
 serving-metric errors; `scripts/draw.py` plots latency and throughput.
@@ -73,6 +74,8 @@ own all serving semantics and reach the engine only through graph nodes.
   [cost models](architectures/cost-models.md).
 - `scripts/profile.py` measures vLLM components and preserves exact batch shapes
   in JSONL; see [profiling](architectures/profiling.md).
+- `scripts/import_fpm.py` normalizes public forward-pass measurements (FPM) of one
+  deployment; see [cost models](architectures/cost-models.md).
 - `scripts/baseline.py` replays single-call workloads and records client-visible
   token timings; see [validation](architectures/validation.md).
 - `scripts/results.py` owns result validation, DAG timing reconstruction, and
@@ -141,6 +144,7 @@ loads. Routed children enter the graph beneath that arrival event.
 crates/simthesizer-core/   engine, component traits, registries, built-ins
 crates/simthesizer-cli/    `simthesizer` binary: config, workload, result IO
 scripts/profile.py        standalone vLLM component profiler
+scripts/import_fpm.py     public forward-pass table importer
 scripts/baseline.py       standalone vLLM workload replay
 scripts/results.py        shared result analysis
 scripts/compare.py        serving-metric error reports
