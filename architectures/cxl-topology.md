@@ -69,4 +69,5 @@ it does not claim optimal allocation on unequal paths, packet behavior or
 measured CXL latency fidelity. Counts and widths remain configuration data.
 
 Native `cxl_topology` tests cover lane ledgers, parallel links, endpoint limits,
-rank/adapter bindings and route isolation.
+rank/adapter bindings and route isolation. A runnable
+[CXL example](../experiments/cxl-ranks-adapters/experiments.md) demonstrates configuration.

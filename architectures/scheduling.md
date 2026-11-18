@@ -102,6 +102,7 @@ and live state without counting the same prefix twice. Computed full blocks
 move into directory ownership, and preemption releases execution pins.
 This mode disables the worker's private cache; the parent directory is the sole
 residency authority. Capacity and transfer readiness feed separate wait phases.
+See [CXL pool lifecycle](cxl-pool.md) for its asynchronous backing hierarchy.
 
 ## Routing
 

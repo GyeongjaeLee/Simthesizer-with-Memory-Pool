@@ -1,0 +1,119 @@
+# Synthetic CPU example; see ../experiments.md.
+[system]
+kind = "cxl_pool"
+block_tokens = 16
+host_capacity_bytes = { "source0" = 8388608, "source1" = 8388608, "target" = 33554432 }
+placement_devices = ["D0", "D1", "D2", "D3"]
+stripe_blocks = 1
+max_outstanding_reads = 32
+calls = [{ "request_id" = 0, "subrequest_index" = 0, "worker" = 0, "seed_host_blocks" = ["session0:B0", "session0:B1", "session0:B2", "session0:B3"] }, { "request_id" = 0, "subrequest_index" = 2, "worker" = 2, "blocks" = ["session0:B0", "session0:B1", "session0:B2", "session0:B3"] }, { "request_id" = 1, "subrequest_index" = 0, "worker" = 1, "seed_host_blocks" = ["session1:B0", "session1:B1", "session1:B2", "session1:B3"] }, { "request_id" = 1, "subrequest_index" = 2, "worker" = 3, "blocks" = ["session1:B0", "session1:B1", "session1:B2", "session1:B3"] }]
+pressures = [{ "request_id" = 0, "subrequest_index" = 1, "owner_request_id" = 2, "node" = "source0", "bytes" = 8388608 }, { "request_id" = 1, "subrequest_index" = 1, "owner_request_id" = 2, "node" = "source1", "bytes" = 8388608 }]
+
+[system.topology]
+endpoints = [
+  { "id" = "switch", "kind" = "switch", "lane_budget" = 256 },
+  { "id" = "fabric", "kind" = "fabric" },
+  { "id" = "source0-dram", "kind" = "dram", "node" = "source0" },
+  { "id" = "source0-nic", "kind" = "nic", "node" = "source0" },
+  { "id" = "source1-dram", "kind" = "dram", "node" = "source1" },
+  { "id" = "source1-nic", "kind" = "nic", "node" = "source1" },
+  { "id" = "target-dram", "kind" = "dram", "node" = "target" },
+  { "id" = "target-nic", "kind" = "nic", "node" = "target" },
+  { "id" = "source0-adapter", "kind" = "adapter", "node" = "source0" },
+  { "id" = "source1-adapter", "kind" = "adapter", "node" = "source1" },
+  { "id" = "a0", "kind" = "adapter", "node" = "target" },
+  { "id" = "a1", "kind" = "adapter", "node" = "target" },
+  { "id" = "downstream-in", "kind" = "junction", "node" = "target" },
+  { "id" = "downstream-out", "kind" = "junction", "node" = "target" },
+  { "id" = "w0-r0-gpu", "kind" = "gpu", "node" = "source0" },
+  { "id" = "w0-r1-gpu", "kind" = "gpu", "node" = "source0" },
+  { "id" = "w1-r0-gpu", "kind" = "gpu", "node" = "source1" },
+  { "id" = "w1-r1-gpu", "kind" = "gpu", "node" = "source1" },
+  { "id" = "w2-r0-gpu", "kind" = "gpu", "node" = "target" },
+  { "id" = "w2-r1-gpu", "kind" = "gpu", "node" = "target" },
+  { "id" = "w3-r0-gpu", "kind" = "gpu", "node" = "target" },
+  { "id" = "w3-r1-gpu", "kind" = "gpu", "node" = "target" },
+  { "id" = "D0", "kind" = "memory", "capacity_bytes" = 1073741824, "read_bandwidth" = 1000000000000.0, "write_bandwidth" = 1000000000000.0 },
+  { "id" = "D1", "kind" = "memory", "capacity_bytes" = 1073741824, "read_bandwidth" = 1000000000000.0, "write_bandwidth" = 1000000000000.0 },
+  { "id" = "D2", "kind" = "memory", "capacity_bytes" = 1073741824, "read_bandwidth" = 1000000000000.0, "write_bandwidth" = 1000000000000.0 },
+  { "id" = "D3", "kind" = "memory", "capacity_bytes" = 1073741824, "read_bandwidth" = 1000000000000.0, "write_bandwidth" = 1000000000000.0 }
+]
+links = [
+  { "id" = "source0-dram-nic", "a" = "source0-dram", "b" = "source0-nic", "a_port" = "source0-dram-nic:a", "b_port" = "source0-dram-nic:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "source0-fabric", "a" = "source0-nic", "b" = "fabric", "a_port" = "source0-fabric:a", "b_port" = "source0-fabric:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0, "bandwidth_ba" = 1000000000000.0 },
+  { "id" = "source1-dram-nic", "a" = "source1-dram", "b" = "source1-nic", "a_port" = "source1-dram-nic:a", "b_port" = "source1-dram-nic:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "source1-fabric", "a" = "source1-nic", "b" = "fabric", "a_port" = "source1-fabric:a", "b_port" = "source1-fabric:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0, "bandwidth_ba" = 1000000000000.0 },
+  { "id" = "target-dram-nic", "a" = "target-dram", "b" = "target-nic", "a_port" = "target-dram-nic:a", "b_port" = "target-dram-nic:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "target-fabric", "a" = "target-nic", "b" = "fabric", "a_port" = "target-fabric:a", "b_port" = "target-fabric:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0, "bandwidth_ba" = 1000000000000.0 },
+  { "id" = "port-source0-adapter", "a" = "switch", "b" = "source0-adapter", "a_port" = "port-source0-adapter:a", "b_port" = "port-source0-adapter:b", "bandwidth_ab" = 64000000000.0, "latency" = 0.0, "bandwidth_ba" = 64000000000.0, "width" = 16 },
+  { "id" = "dram-source0-adapter", "a" = "source0-dram", "b" = "source0-adapter", "a_port" = "dram-source0-adapter:a", "b_port" = "dram-source0-adapter:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "port-source1-adapter", "a" = "switch", "b" = "source1-adapter", "a_port" = "port-source1-adapter:a", "b_port" = "port-source1-adapter:b", "bandwidth_ab" = 64000000000.0, "latency" = 0.0, "bandwidth_ba" = 64000000000.0, "width" = 16 },
+  { "id" = "dram-source1-adapter", "a" = "source1-dram", "b" = "source1-adapter", "a_port" = "dram-source1-adapter:a", "b_port" = "dram-source1-adapter:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "port-a0", "a" = "switch", "b" = "a0", "a_port" = "port-a0:a", "b_port" = "port-a0:b", "bandwidth_ab" = 64000000000.0, "latency" = 0.0, "bandwidth_ba" = 64000000000.0, "width" = 16 },
+  { "id" = "dram-a0", "a" = "target-dram", "b" = "a0", "a_port" = "dram-a0:a", "b_port" = "dram-a0:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "port-a1", "a" = "switch", "b" = "a1", "a_port" = "port-a1:a", "b_port" = "port-a1:b", "bandwidth_ab" = 64000000000.0, "latency" = 0.0, "bandwidth_ba" = 64000000000.0, "width" = 16 },
+  { "id" = "dram-a1", "a" = "target-dram", "b" = "a1", "a_port" = "dram-a1:a", "b_port" = "dram-a1:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "a0-downstream", "a" = "a0", "b" = "downstream-in", "a_port" = "a0-downstream:a", "b_port" = "a0-downstream:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "a1-downstream", "a" = "a1", "b" = "downstream-in", "a_port" = "a1-downstream:a", "b_port" = "a1-downstream:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "downstream", "a" = "downstream-in", "b" = "downstream-out", "a_port" = "downstream:a", "b_port" = "downstream:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "target-nic-downstream", "a" = "target-nic", "b" = "downstream-in", "a_port" = "target-nic-downstream:a", "b_port" = "target-nic-downstream:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w0-r0-gpu-egress", "a" = "w0-r0-gpu", "b" = "source0-nic", "a_port" = "w0-r0-gpu-egress:a", "b_port" = "w0-r0-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w0-r0-gpu-cxl", "a" = "source0-adapter", "b" = "w0-r0-gpu", "a_port" = "w0-r0-gpu-cxl:a", "b_port" = "w0-r0-gpu-cxl:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w0-r0-gpu-rdma", "a" = "source0-nic", "b" = "w0-r0-gpu", "a_port" = "w0-r0-gpu-rdma:a", "b_port" = "w0-r0-gpu-rdma:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w0-r1-gpu-egress", "a" = "w0-r1-gpu", "b" = "source0-nic", "a_port" = "w0-r1-gpu-egress:a", "b_port" = "w0-r1-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w0-r1-gpu-cxl", "a" = "source0-adapter", "b" = "w0-r1-gpu", "a_port" = "w0-r1-gpu-cxl:a", "b_port" = "w0-r1-gpu-cxl:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w0-r1-gpu-rdma", "a" = "source0-nic", "b" = "w0-r1-gpu", "a_port" = "w0-r1-gpu-rdma:a", "b_port" = "w0-r1-gpu-rdma:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w1-r0-gpu-egress", "a" = "w1-r0-gpu", "b" = "source1-nic", "a_port" = "w1-r0-gpu-egress:a", "b_port" = "w1-r0-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w1-r0-gpu-cxl", "a" = "source1-adapter", "b" = "w1-r0-gpu", "a_port" = "w1-r0-gpu-cxl:a", "b_port" = "w1-r0-gpu-cxl:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w1-r0-gpu-rdma", "a" = "source1-nic", "b" = "w1-r0-gpu", "a_port" = "w1-r0-gpu-rdma:a", "b_port" = "w1-r0-gpu-rdma:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w1-r1-gpu-egress", "a" = "w1-r1-gpu", "b" = "source1-nic", "a_port" = "w1-r1-gpu-egress:a", "b_port" = "w1-r1-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w1-r1-gpu-cxl", "a" = "source1-adapter", "b" = "w1-r1-gpu", "a_port" = "w1-r1-gpu-cxl:a", "b_port" = "w1-r1-gpu-cxl:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w1-r1-gpu-rdma", "a" = "source1-nic", "b" = "w1-r1-gpu", "a_port" = "w1-r1-gpu-rdma:a", "b_port" = "w1-r1-gpu-rdma:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w2-r0-gpu-egress", "a" = "w2-r0-gpu", "b" = "target-nic", "a_port" = "w2-r0-gpu-egress:a", "b_port" = "w2-r0-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w2-r0-gpu-ingress", "a" = "downstream-out", "b" = "w2-r0-gpu", "a_port" = "w2-r0-gpu-ingress:a", "b_port" = "w2-r0-gpu-ingress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w2-r1-gpu-egress", "a" = "w2-r1-gpu", "b" = "target-nic", "a_port" = "w2-r1-gpu-egress:a", "b_port" = "w2-r1-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w2-r1-gpu-ingress", "a" = "downstream-out", "b" = "w2-r1-gpu", "a_port" = "w2-r1-gpu-ingress:a", "b_port" = "w2-r1-gpu-ingress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w3-r0-gpu-egress", "a" = "w3-r0-gpu", "b" = "target-nic", "a_port" = "w3-r0-gpu-egress:a", "b_port" = "w3-r0-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w3-r0-gpu-ingress", "a" = "downstream-out", "b" = "w3-r0-gpu", "a_port" = "w3-r0-gpu-ingress:a", "b_port" = "w3-r0-gpu-ingress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w3-r1-gpu-egress", "a" = "w3-r1-gpu", "b" = "target-nic", "a_port" = "w3-r1-gpu-egress:a", "b_port" = "w3-r1-gpu-egress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "w3-r1-gpu-ingress", "a" = "downstream-out", "b" = "w3-r1-gpu", "a_port" = "w3-r1-gpu-ingress:a", "b_port" = "w3-r1-gpu-ingress:b", "bandwidth_ab" = 1000000000000.0, "latency" = 0.0 },
+  { "id" = "memory0", "a" = "switch", "b" = "D0", "a_port" = "memory0:a", "b_port" = "memory0:b", "bandwidth_ab" = 32000000000.0, "latency" = 0.0, "bandwidth_ba" = 32000000000.0, "width" = 8 },
+  { "id" = "memory1", "a" = "switch", "b" = "D1", "a_port" = "memory1:a", "b_port" = "memory1:b", "bandwidth_ab" = 32000000000.0, "latency" = 0.0, "bandwidth_ba" = 32000000000.0, "width" = 8 },
+  { "id" = "memory2", "a" = "switch", "b" = "D2", "a_port" = "memory2:a", "b_port" = "memory2:b", "bandwidth_ab" = 32000000000.0, "latency" = 0.0, "bandwidth_ba" = 32000000000.0, "width" = 8 },
+  { "id" = "memory3", "a" = "switch", "b" = "D3", "a_port" = "memory3:a", "b_port" = "memory3:b", "bandwidth_ab" = 32000000000.0, "latency" = 0.0, "bandwidth_ba" = 32000000000.0, "width" = 8 }
+]
+workers = [
+  { "worker" = 0, "rank" = 0, "node" = "source0", "adapters" = ["source0-adapter"], "dram" = "source0-dram", "nic" = "source0-nic", "gpu" = "w0-r0-gpu" },
+  { "worker" = 0, "rank" = 1, "node" = "source0", "adapters" = ["source0-adapter"], "dram" = "source0-dram", "nic" = "source0-nic", "gpu" = "w0-r1-gpu" },
+  { "worker" = 1, "rank" = 0, "node" = "source1", "adapters" = ["source1-adapter"], "dram" = "source1-dram", "nic" = "source1-nic", "gpu" = "w1-r0-gpu" },
+  { "worker" = 1, "rank" = 1, "node" = "source1", "adapters" = ["source1-adapter"], "dram" = "source1-dram", "nic" = "source1-nic", "gpu" = "w1-r1-gpu" },
+  { "worker" = 2, "rank" = 0, "node" = "target", "adapters" = ["a0"], "dram" = "target-dram", "nic" = "target-nic", "gpu" = "w2-r0-gpu" },
+  { "worker" = 2, "rank" = 1, "node" = "target", "adapters" = ["a0"], "dram" = "target-dram", "nic" = "target-nic", "gpu" = "w2-r1-gpu" },
+  { "worker" = 3, "rank" = 0, "node" = "target", "adapters" = ["a0"], "dram" = "target-dram", "nic" = "target-nic", "gpu" = "w3-r0-gpu" },
+  { "worker" = 3, "rank" = 1, "node" = "target", "adapters" = ["a0"], "dram" = "target-dram", "nic" = "target-nic", "gpu" = "w3-r1-gpu" }
+]
+routing = "equal_shortest"
+
+[[system.instances]]
+kind = "single_instance"
+model = { "kind" = "llama3_1", "hidden_size" = 4096, "intermediate_size" = 14336, "max_position_embeddings" = 131072, "num_attention_heads" = 32, "num_hidden_layers" = 32, "num_key_value_heads" = 8, "vocab_size" = 128256 }
+model_runner = { "kind" = "ring", "tp" = 2, "link_bw" = 64000000000.0, "link_latency" = 0.0, "compute_sim" = { "kind" = "table_lookup", "perf_dir" = "synthetic-profile.jsonl", "profile_variant" = "synthetic-tp2" }, "network_sim" = { "kind" = "flow" } }
+scheduler = { "kind" = "chunked_prefill", "block_size" = 16, "max_batch" = 8, "max_num_batched_tokens" = 1024, "device_mem" = 101976440832, "device_mem_utilization" = 0.9, "enable_prefix_caching" = false }
+
+[[system.instances]]
+kind = "single_instance"
+model = { "kind" = "llama3_1", "hidden_size" = 4096, "intermediate_size" = 14336, "max_position_embeddings" = 131072, "num_attention_heads" = 32, "num_hidden_layers" = 32, "num_key_value_heads" = 8, "vocab_size" = 128256 }
+model_runner = { "kind" = "ring", "tp" = 2, "link_bw" = 64000000000.0, "link_latency" = 0.0, "compute_sim" = { "kind" = "table_lookup", "perf_dir" = "synthetic-profile.jsonl", "profile_variant" = "synthetic-tp2" }, "network_sim" = { "kind" = "flow" } }
+scheduler = { "kind" = "chunked_prefill", "block_size" = 16, "max_batch" = 8, "max_num_batched_tokens" = 1024, "device_mem" = 101976440832, "device_mem_utilization" = 0.9, "enable_prefix_caching" = false }
+
+[[system.instances]]
+kind = "single_instance"
+model = { "kind" = "llama3_1", "hidden_size" = 4096, "intermediate_size" = 14336, "max_position_embeddings" = 131072, "num_attention_heads" = 32, "num_hidden_layers" = 32, "num_key_value_heads" = 8, "vocab_size" = 128256 }
+model_runner = { "kind" = "ring", "tp" = 2, "link_bw" = 64000000000.0, "link_latency" = 0.0, "compute_sim" = { "kind" = "table_lookup", "perf_dir" = "synthetic-profile.jsonl", "profile_variant" = "synthetic-tp2" }, "network_sim" = { "kind" = "flow" } }
+scheduler = { "kind" = "chunked_prefill", "block_size" = 16, "max_batch" = 8, "max_num_batched_tokens" = 1024, "device_mem" = 101976440832, "device_mem_utilization" = 0.9, "enable_prefix_caching" = false }
+
+[[system.instances]]
+kind = "single_instance"
+model = { "kind" = "llama3_1", "hidden_size" = 4096, "intermediate_size" = 14336, "max_position_embeddings" = 131072, "num_attention_heads" = 32, "num_hidden_layers" = 32, "num_key_value_heads" = 8, "vocab_size" = 128256 }
+model_runner = { "kind" = "ring", "tp" = 2, "link_bw" = 64000000000.0, "link_latency" = 0.0, "compute_sim" = { "kind" = "table_lookup", "perf_dir" = "synthetic-profile.jsonl", "profile_variant" = "synthetic-tp2" }, "network_sim" = { "kind" = "flow" } }
+scheduler = { "kind" = "chunked_prefill", "block_size" = 16, "max_batch" = 8, "max_num_batched_tokens" = 1024, "device_mem" = 101976440832, "device_mem_utilization" = 0.9, "enable_prefix_caching" = false }

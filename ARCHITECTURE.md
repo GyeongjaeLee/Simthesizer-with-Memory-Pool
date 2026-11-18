@@ -83,11 +83,16 @@ own all serving semantics and reach the engine only through graph nodes.
   serving metrics shared by comparison and plotting. Analysis never enters the
   simulation path; see [validation](architectures/validation.md).
 - Components expose read-only state; the engine supplies observation times and
-  the CLI writes optional JSONL traces. See [observability](architectures/observability.md).
+  the CLI writes optional JSONL traces. Admission, KV preparation and scheduler
+  waits are disjoint; serving idle derives separately from execution intervals.
+  See [observability](architectures/observability.md).
 
 KV identity is independent of ownership and storage location. Completed calls
 release execution references while unreferenced cached content remains reclaimable.
-Hybrid reuse additionally requires a counted recurrent-state checkpoint.
+Hybrid reuse additionally requires a counted recurrent-state checkpoint. The
+optional HBM → host → CXL backing hierarchy is a Simthesizer extension; asynchronous
+storage and HBM reclamation are separate operations, with reservations and copy
+lifetimes charged to their actual tiers. See [CXL KV pool](architectures/cxl-pool.md).
 
 Detailed contracts:
 
@@ -103,6 +108,7 @@ Detailed contracts:
 - [Observability](architectures/observability.md)
 - [Agent workflow](architectures/agent-workflow.md)
 - [CXL physical topology](architectures/cxl-topology.md)
+- [CXL KV pool](architectures/cxl-pool.md)
 
 ## Simulation Flow
 
@@ -154,6 +160,7 @@ scripts/profile.py        standalone vLLM component profiler
 scripts/import_fpm.py     public forward-pass table importer
 scripts/baseline.py       standalone vLLM workload replay
 scripts/results.py        shared result analysis
+scripts/kv_metrics.py     disjoint wait and serving-idle trace analysis
 scripts/compare.py        serving-metric error reports
 scripts/draw.py           latency and throughput figures
 tools/                    agent workflow and validation tools
@@ -172,6 +179,10 @@ architectures/             component architecture documents
 initialization. The CLI depends on the core, never the reverse.
 
 `scripts/` contains commands for human use; `tools/` contains agent-facing tools.
+
+Keep reusable examples under version control and run artifacts under `output/`.
+Architecture documents own component contracts; tests own regression fixtures.
+Avoid per-task copies of those facts and parallel validation frameworks.
 
 ## Evolution Rules
 

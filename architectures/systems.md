@@ -88,6 +88,12 @@ counts the reserved request in load, and retains that selection at arrival.
 Each EP scheduler reserves its own KV bytes. Aggregate `single_instance` EP
 has no stable rank-local owner and cannot accept external KV.
 
+The opt-in `cxl_pool` system owns a shared KV directory and original request
+DAGs. It assigns individual released LLM calls to existing worker systems,
+gates them on KV movement, and merges their timings into the original DAG.
+Host pressure, publication and reload use native graph events. See
+[CXL KV pool](cxl-pool.md).
+
 ## Evolution Rules
 
 - Build a new topology by composing systems through seeding and sinks before

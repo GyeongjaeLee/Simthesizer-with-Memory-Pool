@@ -46,7 +46,24 @@ site, including the final prefill chunk. Cached input and scheduled work do not
 increment it. Routing load snapshots retain their existing batch-based meaning.
 
 Wait gauges partition enqueued calls: external KV preparation takes precedence
-over admission and scheduler waiting.
+over admission and scheduler waiting. CXL parent admission and preparation
+gauges count only calls not yet enqueued in a child. Resumed calls appear in
+the child preparation gauge. Durations on individual CXL events can span
+multiple phases; use the gauges for disjoint totals.
+
+`python scripts/kv_metrics.py TRACE.jsonl --output METRICS.json` integrates
+snapshots until the final trace timestamp. Wait totals are request-seconds;
+concurrent requests can make them exceed elapsed time. `any_request_waiting_s`
+instead measures the union of waiting intervals. Neither quantity is GPU idle.
+
+`gpu_idle_s` measures intervals with no active serving iteration. An iteration
+includes its internal compute and collectives; this is serving-device idle,
+not per-kernel SM idle. A TP worker is one execution domain. Joint EP exposes
+system-level `iteration_active`, so an empty attention rank participating in
+expert execution does not become an idle GPU. Global idle is the union of
+intervals when every execution domain is idle, independent of waiting calls.
+The analyzer rejects missing phase gauges, ambiguous EP occupancy, changing
+component scopes, and invalid clocks. It never extrapolates beyond the trace.
 
 ## Composition and comparison
 
