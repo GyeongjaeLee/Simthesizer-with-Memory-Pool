@@ -112,6 +112,17 @@ pub struct TopologyNetwork {
     cuts: BTreeMap<String, DirectedCut>,
     adapter_links: BTreeMap<String, (usize, usize)>,
     transfer_routes: Vec<TransferRoute>,
+    trunks: Vec<Trunk>,
+}
+
+/// Parallel physical links between two switches share one flow link per
+/// direction. Equal striping loads members equally, so the trunk carries their
+/// summed rate without enumerating every member combination along a path.
+struct Trunk {
+    forward: usize,
+    reverse: usize,
+    /// Member link IDs; `true` when declared in the trunk's forward orientation.
+    members: Vec<(String, bool)>,
 }
 
 #[derive(PartialEq, Serialize)]
@@ -143,6 +154,7 @@ impl Topology {
         let mut lanes = BTreeMap::new();
         let mut cuts = BTreeMap::<String, DirectedCut>::new();
         let mut adapter_links = BTreeMap::new();
+        let mut trunk_links = BTreeMap::<(&str, &str), (f64, f64, f64, Vec<(String, bool)>)>::new();
         for endpoint in &self.endpoints {
             ensure!(!endpoint.id.is_empty(), "empty endpoint name");
             ensure!(
@@ -261,6 +273,24 @@ impl Topology {
                     }
                 }
             }
+            if link.width.is_some()
+                && a.kind == EndpointKind::Switch
+                && b.kind == EndpointKind::Switch
+            {
+                let forward = link.a < link.b;
+                let key = if forward {
+                    (link.a.as_str(), link.b.as_str())
+                } else {
+                    (link.b.as_str(), link.a.as_str())
+                };
+                let (ab, ba) = (link.bandwidth_ab, link.bandwidth_ba.unwrap());
+                let trunk = trunk_links.entry(key).or_default();
+                trunk.0 += if forward { ab } else { ba };
+                trunk.1 += if forward { ba } else { ab };
+                trunk.2 = trunk.2.max(link.latency);
+                trunk.3.push((link.id.clone(), forward));
+                continue;
+            }
             let ab = flow.add_named_link(
                 ports[&link.a],
                 ports[&link.b],
@@ -285,6 +315,31 @@ impl Topology {
                     }
                 }
             }
+        }
+        let mut trunks = Vec::new();
+        for ((a, b), (forward, reverse, latency, members)) in trunk_links {
+            let name = members
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
+            trunks.push(Trunk {
+                forward: flow.add_named_link(
+                    ports[a],
+                    ports[b],
+                    forward,
+                    latency,
+                    format!("{name}:ab"),
+                )?,
+                reverse: flow.add_named_link(
+                    ports[b],
+                    ports[a],
+                    reverse,
+                    latency,
+                    format!("{name}:ba"),
+                )?,
+                members,
+            });
         }
         let mut adapters = HashMap::new();
         for endpoint in &self.endpoints {
@@ -367,6 +422,7 @@ impl Topology {
             cuts,
             adapter_links,
             transfer_routes: Vec::new(),
+            trunks,
         };
         // A declared worker must be able to spill and reload every pool device.
         let mut defaults = HashSet::new();
@@ -567,7 +623,29 @@ impl TopologyNetwork {
     }
 
     pub fn observe(&self) -> serde_json::Value {
-        let flow = self.flow.observe();
+        let mut flow = self.flow.observe();
+        // Report each trunk member as an equal share, as striping loads it.
+        let mut members = Vec::new();
+        for trunk in self.trunks.iter().filter(|trunk| trunk.members.len() > 1) {
+            let share = trunk.members.len() as f64;
+            for (id, forward) in &trunk.members {
+                for (direction, same) in [("ab", true), ("ba", false)] {
+                    let index = if same == *forward {
+                        trunk.forward
+                    } else {
+                        trunk.reverse
+                    };
+                    let mut stats = flow["links"][index].clone();
+                    stats["name"] = format!("{id}:{direction}").into();
+                    stats["trunk"] = index.into();
+                    for field in ["bandwidth", "bytes"] {
+                        stats[field] = (stats[field].as_f64().unwrap_or(0.0) / share).into();
+                    }
+                    members.push(stats);
+                }
+            }
+        }
+        flow["links"].as_array_mut().unwrap().extend(members);
         let adapters = self
             .adapter_links
             .iter()

@@ -1,6 +1,8 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -105,6 +107,10 @@ pub struct FlowNetworkSimulator {
 
     #[serde(skip_deserializing, default)]
     flow_states: HashMap<FlowID, *mut FlowTransferState>,
+
+    /// Rates for the current active flow set; cleared when it changes.
+    #[serde(skip_deserializing, default)]
+    rates: RefCell<Option<Rc<HashMap<FlowID, f64>>>>,
 }
 
 crate::register_network_simulator!(FlowNetworkSimulator, "flow");
@@ -573,6 +579,7 @@ impl FlowNetworkSimulator {
                 link.peak_flows = link.peak_flows.max(link.active_flows.len());
             }
             self.flow_states.insert(flow_id, flow_ptr);
+            self.rates.take();
             transfer.flows.push(flow);
         }
         let ids = transfer.flows.iter().map(|flow| flow.flow_id).collect();
@@ -582,58 +589,74 @@ impl FlowNetworkSimulator {
 
     /// Weighted max-min fair rates by progressive filling: links that saturate
     /// first fix their flows; capacity a flow cannot use elsewhere stays with
-    /// the others, as in work-conserving link arbitration.
-    fn active_rates(&self) -> HashMap<FlowID, f64> {
-        let mut capacity = HashMap::new();
-        let mut flows = HashMap::<FlowID, (f64, Vec<usize>)>::new();
-        for (index, link) in self.links.iter().enumerate() {
-            if link.active_flows.is_empty() {
-                continue;
-            }
-            capacity.insert(index, link.bandwidth);
+    /// the others, as in work-conserving link arbitration. Rates depend only on
+    /// the active flow set, so they are cached until it changes.
+    fn active_rates(&self) -> Rc<HashMap<FlowID, f64>> {
+        if let Some(rates) = self.rates.borrow().as_ref() {
+            return rates.clone();
+        }
+        let mut index = HashMap::new();
+        let (mut ids, mut weights, mut flow_links) =
+            (Vec::new(), Vec::new(), Vec::<Vec<usize>>::new());
+        let (mut capacity, mut link_flows) = (Vec::new(), Vec::<Vec<usize>>::new());
+        for link in self
+            .links
+            .iter()
+            .filter(|link| !link.active_flows.is_empty())
+        {
+            let l = capacity.len();
+            capacity.push(link.bandwidth);
+            let mut members = Vec::with_capacity(link.active_flows.len());
             for &flow_id in &link.active_flows {
-                let weight = unsafe { (*self.flow_states[&flow_id]).weight };
-                flows
-                    .entry(flow_id)
-                    .or_insert_with(|| (weight, Vec::new()))
-                    .1
-                    .push(index);
+                let f = *index.entry(flow_id).or_insert_with(|| {
+                    ids.push(flow_id);
+                    weights.push(unsafe { (*self.flow_states[&flow_id]).weight });
+                    flow_links.push(Vec::new());
+                    ids.len() - 1
+                });
+                flow_links[f].push(l);
+                members.push(f);
             }
+            link_flows.push(members);
         }
-        let mut rates = HashMap::with_capacity(flows.len());
-        while !flows.is_empty() {
-            let mut demand: HashMap<usize, f64> = HashMap::new();
-            for (weight, links) in flows.values() {
-                for &link in links {
-                    *demand.entry(link).or_default() += weight;
-                }
-            }
-            let level = demand
-                .iter()
-                .map(|(link, weight)| capacity[link].max(0.0) / weight)
+        let mut demand: Vec<f64> = link_flows
+            .iter()
+            .map(|members| members.iter().map(|&f| weights[f]).sum())
+            .collect();
+        let mut unfixed: Vec<usize> = link_flows.iter().map(Vec::len).collect();
+        let mut rate = vec![None; ids.len()];
+        let mut remaining = ids.len();
+        while remaining > 0 {
+            let share = |l: usize| capacity[l].max(0.0) / demand[l];
+            let level = (0..capacity.len())
+                .filter(|&l| unfixed[l] > 0)
+                .map(share)
                 .fold(f64::INFINITY, f64::min);
-            let saturated: HashSet<usize> = demand
-                .iter()
-                .filter(|(link, weight)| {
-                    capacity[*link].max(0.0) / *weight <= level * (1.0 + RELATIVE_BYTES_EPSILON)
-                })
-                .map(|(&link, _)| link)
-                .collect();
-            let mut fixed: Vec<FlowID> = flows
-                .iter()
-                .filter(|(_, (_, links))| links.iter().any(|link| saturated.contains(link)))
-                .map(|(&flow_id, _)| flow_id)
-                .collect();
-            fixed.sort_unstable();
-            for flow_id in fixed {
-                let (weight, links) = flows.remove(&flow_id).expect("fixed flow is active");
-                let rate = weight * level;
-                for link in links {
-                    *capacity.get_mut(&link).expect("active link") -= rate;
+            let saturated = (0..capacity.len())
+                .filter(|&l| unfixed[l] > 0 && share(l) <= level * (1.0 + RELATIVE_BYTES_EPSILON))
+                .collect::<Vec<_>>();
+            for l in saturated {
+                for &f in &link_flows[l] {
+                    if rate[f].is_some() {
+                        continue;
+                    }
+                    let fixed = weights[f] * level;
+                    rate[f] = Some(fixed);
+                    remaining -= 1;
+                    for &k in &flow_links[f] {
+                        capacity[k] -= fixed;
+                        demand[k] -= weights[f];
+                        unfixed[k] -= 1;
+                    }
                 }
-                rates.insert(flow_id, rate);
             }
         }
+        let rates = Rc::new(
+            ids.into_iter()
+                .zip(rate.into_iter().map(Option::unwrap))
+                .collect(),
+        );
+        *self.rates.borrow_mut() = Some(Rc::clone(&rates));
         rates
     }
 
@@ -733,6 +756,7 @@ impl FlowNetworkSimulator {
     }
 
     fn release_flow_links(&mut self, flow_id: FlowID, route: &Route) {
+        self.rates.take();
         for &link_index in &route.link_indices {
             self.links[link_index].active_flows.remove(&flow_id);
         }
@@ -885,6 +909,7 @@ impl FlowNetworkSimulator {
         if !latency.is_finite() || latency < 0.0 {
             bail!("network link latency must be finite and non-negative");
         }
+        self.rates.take();
         let link_index = self.links.len();
         self.links.push(DirectionalLink {
             src,
