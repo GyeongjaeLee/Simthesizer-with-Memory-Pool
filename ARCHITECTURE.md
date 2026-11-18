@@ -82,6 +82,9 @@ own all serving semantics and reach the engine only through graph nodes.
 - `scripts/results.py` owns result validation, DAG timing reconstruction, and
   serving metrics shared by comparison and plotting. Analysis never enters the
   simulation path; see [validation](architectures/validation.md).
+- `scripts/freeinference.py` preserves provider-count workloads or emits
+  namespaced proxy-prefix input from original full source blocks. Dataset
+  conversion does not infer KV identity from token counts or session membership.
 - Components expose read-only state; the engine supplies observation times and
   the CLI writes optional JSONL traces. Admission, KV preparation and scheduler
   waits are disjoint; serving idle derives separately from execution intervals.
@@ -160,6 +163,7 @@ scripts/profile.py        standalone vLLM component profiler
 scripts/import_fpm.py     public forward-pass table importer
 scripts/baseline.py       standalone vLLM workload replay
 scripts/results.py        shared result analysis
+scripts/freeinference.py  provider-count and proxy-prefix workload conversion
 scripts/kv_metrics.py     disjoint wait and serving-idle trace analysis
 scripts/compare.py        serving-metric error reports
 scripts/draw.py           latency and throughput figures

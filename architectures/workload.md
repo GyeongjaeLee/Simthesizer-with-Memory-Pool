@@ -61,6 +61,34 @@ drifting apart.
 - Raw agent traces are converted to canonical rows offline. Runtime accepts
   only canonical rows.
 
+## FreeInference ingestion
+
+`scripts/freeinference.py` fetches pinned compressed sources, verifies and
+indexes sessions, and generates native DAGs. Arrival mode selects original
+session timestamps, regular session/s, or seeded Poisson session/s.
+
+Default `provider-count` mode uses provider prompt/completion counts and emits
+no prefix identity. `proxy-prefix` recovers original complete 16-token
+`o200k_base` block lists from verified raw sources; input length is 16 times
+their count. Its namespace contains dataset revision, week, source model,
+explicit target model/KV layout and sharing scope. Session ownership remains
+separate. The configured native model supplies KV bytes and compute costs.
+
+Both modes retain provider counts. Provider completion is only a generation
+length approximation; it is not a measured proxy-tokenizer count. Partial final
+proxy blocks (0–15 tokens) are absent, and output-to-next-input identity cannot
+be recovered. The converter never synthesizes those identities. Compact indexes
+retain counts; proxy generation streams each selected raw file once and spools
+selected sessions, avoiding corpus-wide block arrays in memory.
+
+Nested sessions become branches. Mid-response launches use observed delay
+from parent release; later launches follow parent completion. A child that
+finishes before the next recorded parent call gates it, with only the residual
+gap charged. Other children drain asynchronously. These timing-derived
+dependencies approximate streaming tool dispatch; they are not token-level
+observations. Conversion never supplies model profiles or CXL placement.
+See `experiments/freeinference-load/experiments.md` for selection and fidelity.
+
 ## Evolution Rules
 
 - Convert a new trace source offline; never teach runtime a second format.
