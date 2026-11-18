@@ -1,4 +1,4 @@
-# H200 MiniMax-M2.7 TP4 workers sharing CXL adapters; see ../experiments.md.
+# H200 MiniMax-M2.7 TP4 workers sharing CXL adapters; a fixture for pool mechanics.
 [system]
 kind = "cxl_pool"
 block_tokens = 16

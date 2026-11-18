@@ -69,5 +69,11 @@ it does not claim optimal allocation on unequal paths, packet behavior or
 measured CXL latency fidelity. Counts and widths remain configuration data.
 
 Native `cxl_topology` tests cover lane ledgers, parallel links, endpoint limits,
-rank/adapter bindings and route isolation. A runnable
-[CXL example](../experiments/cxl-ranks-adapters/experiments.md) demonstrates configuration.
+rank/adapter bindings and route isolation.
+[`experiments/cxl-pool/generate.py`](../experiments/cxl-pool/generate.py) emits
+single-switch, uniform and non-uniform pool scenarios.
+
+Parallel physical links between two switches form one flow trunk per direction
+with their summed rate, while lanes stay counted per port. Equal striping loads
+members equally, so this matches per-port flows without enumerating every
+member combination along a path; observations report each member's share.
