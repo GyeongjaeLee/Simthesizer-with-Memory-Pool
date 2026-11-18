@@ -1,10 +1,11 @@
-use std::collections::{HashSet, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
+use std::hash::{Hash, Hasher};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 
 use crate::module::Module;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{KvMemoryInfo, Scheduler};
 use crate::schedulers::prefix_cache::{hash_block, PrefixCache};
 use crate::types::{
     InstanceLoad, NodeID, ParallelStrategy, ReadySubRequest, RequestState, SubRequestCompletion,
@@ -21,7 +22,37 @@ pub struct ChunkedPrefillScheduler {
     /// Per-GPU workspace (activations, graphs, communication buffers).
     #[serde(default)]
     reserved_device_bytes: u64,
+    #[serde(default = "default_true")]
     enable_prefix_caching: bool,
+    #[serde(default)]
+    num_lookahead_tokens: u32,
+    #[serde(default = "default_true")]
+    scheduler_reserve_full_isl: bool,
+    #[serde(skip)]
+    preemptions_total: u64,
+    #[serde(skip)]
+    progress: Vec<(u64, u32)>,
+    #[serde(skip)]
+    external_preemptions: Vec<u64>,
+    #[serde(skip)]
+    admission_waiting: HashSet<NodeID>,
+    #[serde(skip)]
+    external_blocked: HashSet<u64>,
+    #[serde(skip)]
+    external_admission: HashSet<u64>,
+    #[serde(skip)]
+    next_cache_nonce: u64,
+    #[serde(skip)]
+    external_reclaim: Option<(u64, u64)>,
+
+    #[serde(skip)]
+    external_kv_enabled: bool,
+    #[serde(skip)]
+    external_kv_bytes: u64,
+    #[serde(skip)]
+    external_kv_reclaimable_bytes: u64,
+    #[serde(skip)]
+    external_prefixes: HashMap<u64, u32>,
 
     #[serde(skip_deserializing, default)]
     queue: LinkedList<RunningRequest>,
@@ -60,14 +91,39 @@ pub struct ChunkedPrefillScheduler {
     effective_max_num_batched_tokens: u32,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 crate::register_scheduler!(ChunkedPrefillScheduler, "chunked_prefill");
 
 impl Module for ChunkedPrefillScheduler {
     fn observe(&self) -> serde_json::Value {
+        let waiting = self.queue.iter().skip(self.current_batch.len());
+        let kv_waiting = waiting
+            .clone()
+            .filter(|r| self.external_blocked.contains(&r.request_id))
+            .count();
+        let admission = waiting
+            .clone()
+            .filter(|r| {
+                !self.external_blocked.contains(&r.request_id)
+                    && (self.admission_waiting.contains(&r.completion_node_id)
+                        || self.external_admission.contains(&r.request_id))
+            })
+            .count();
+
         serde_json::json!({
             "running_requests": self.admitted.len(),
             "waiting_requests": self.queue.len() - self.admitted.len(),
             "generation_tokens_total": self.generation_tokens_total,
+            "hbm_allocated_bytes": self.hbm_bytes(),
+            "prefix_cache_bytes": self.prefix_cache.bytes_used(self.block_size, self.kv_bytes_per_token_per_device),
+            "preemptions_total": self.preemptions_total,
+            "hbm_admission_waiting_requests": admission,
+            "kv_preparation_waiting_requests": kv_waiting,
+            "scheduler_waiting_requests": self.queue.len().saturating_sub(self.current_batch.len()).saturating_sub(admission + kv_waiting),
+            "iteration_active": self.running,
         })
     }
 }
@@ -84,16 +140,20 @@ struct RunningRequest {
     known_tokens: u32,
     shared_kv_tokens: u32,
     private_kv_tokens: u32,
+    external_kv_tokens: u32,
     last_time: f64,
     token_latency: Vec<f64>,
 
     input_token_ids: Option<Vec<u32>>,
     output_token_ids: Option<Vec<u32>>,
     block_hashes: Vec<u64>,
-}
-
-fn block_count(num_tokens: u32, block_size: u32) -> u32 {
-    num_tokens.div_ceil(block_size)
+    kv_prefix: Option<crate::types::KvPrefix>,
+    private_capacity_tokens: u64,
+    cache_nonce: u64,
+    state_copies: u64,
+    align_state: bool,
+    state_hash: Option<u64>,
+    external_state_source: bool,
 }
 
 impl RunningRequest {
@@ -108,11 +168,19 @@ impl RunningRequest {
             known_tokens: request.known_tokens,
             shared_kv_tokens: 0,
             private_kv_tokens: request.kv_tokens,
+            external_kv_tokens: 0,
             last_time: request.arrival_time,
             token_latency: Vec::new(),
             input_token_ids: request.input_token_ids,
             output_token_ids: request.output_token_ids,
             block_hashes: Vec::new(),
+            kv_prefix: request.kv_prefix,
+            private_capacity_tokens: u64::from(request.kv_tokens),
+            cache_nonce: 0,
+            state_copies: u64::from(request.kv_tokens > 0),
+            align_state: false,
+            state_hash: None,
+            external_state_source: false,
         }
     }
 
@@ -126,49 +194,93 @@ impl RunningRequest {
         kv_bytes_per_request_per_device: u64,
         kv_bytes_per_token_per_device: u64,
     ) -> u64 {
-        let token_bytes = u64::from(block_count(self.private_kv_tokens, block_size))
-            * u64::from(block_size)
+        let token_bytes = (u64::from(self.private_kv_tokens)
+            .max(self.private_capacity_tokens)
+            .div_ceil(u64::from(block_size))
+            * u64::from(block_size))
+        .saturating_sub(u64::from(self.external_kv_tokens))
             * kv_bytes_per_token_per_device;
-        let request_bytes =
-            u64::from(self.effective_kv_tokens() > 0) * kv_bytes_per_request_per_device;
+        let request_bytes = self.state_copies * kv_bytes_per_request_per_device;
         token_bytes + request_bytes
     }
 
     fn private_kv_bytes_after(
         &self,
-        q_len: u32,
+        q_len: u64,
+        state_q_len: u64,
         block_size: u32,
         kv_bytes_per_request_per_device: u64,
         kv_bytes_per_token_per_device: u64,
     ) -> u64 {
-        let total_kv_tokens = self.private_kv_tokens + q_len;
-        let token_bytes = u64::from(block_count(total_kv_tokens, block_size))
-            * u64::from(block_size)
+        let total_kv_tokens = u64::from(self.private_kv_tokens) + q_len;
+        let token_bytes = (total_kv_tokens.div_ceil(u64::from(block_size)) * u64::from(block_size))
+            .saturating_sub(u64::from(self.external_kv_tokens))
             * kv_bytes_per_token_per_device;
         let request_bytes =
-            u64::from(self.effective_kv_tokens() + q_len > 0) * kv_bytes_per_request_per_device;
+            self.state_copies_after(state_q_len, block_size) * kv_bytes_per_request_per_device;
         token_bytes + request_bytes
     }
 
+    fn state_copies_after(&self, q_len: u64, block_size: u32) -> u64 {
+        if !self.align_state {
+            return 1;
+        }
+        let before = u64::from(self.effective_kv_tokens()).div_ceil(u64::from(block_size));
+        let after = (u64::from(self.effective_kv_tokens()) + q_len).div_ceil(u64::from(block_size));
+        1 + u64::from(self.state_copies > 0 && before > 0 && after > before)
+    }
+
+    fn replay_checkpoint(&self, block_size: u32) -> u32 {
+        self.input_tokens.saturating_sub(1) / block_size * block_size
+    }
+
     fn ensure_block_hashes(&mut self, block_size: u32, max_tokens: u32) {
-        let Some(input) = self.input_token_ids.as_deref() else {
-            return;
-        };
-        let output = self.output_token_ids.as_deref().unwrap_or_default();
         let bs = block_size as usize;
-        let count = (max_tokens as usize).min(input.len() + output.len()) / bs;
-        for index in self.block_hashes.len()..count {
-            let start = index * bs;
-            let end = start + bs;
-            let first = &input[start.min(input.len())..end.min(input.len())];
-            let second =
-                &output[start.saturating_sub(input.len())..end.saturating_sub(input.len())];
+        let input = self.input_token_ids.as_deref().unwrap_or_default();
+        let output = self.output_token_ids.as_deref().unwrap_or_default();
+        for index in self.block_hashes.len()..(max_tokens / block_size) as usize {
             let parent = self.block_hashes.last().copied().unwrap_or(0);
-            self.block_hashes.push(hash_block(parent, first, second));
+            if let Some(prefix) = &self.kv_prefix {
+                if block_size.is_multiple_of(prefix.block_tokens) {
+                    let group = (block_size / prefix.block_tokens) as usize;
+                    if let Some(chunk) = prefix.block_ids.get(index * group..(index + 1) * group) {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        "proxy-prefix".hash(&mut hasher);
+                        prefix.namespace.hash(&mut hasher);
+                        block_size.hash(&mut hasher);
+                        parent.hash(&mut hasher);
+                        chunk.hash(&mut hasher);
+                        self.block_hashes.push(hasher.finish());
+                        continue;
+                    }
+                }
+            } else if input.len() == self.input_tokens as usize
+                && (index + 1) * bs <= input.len() + output.len()
+            {
+                let start = index * bs;
+                let end = start + bs;
+                let first = &input[start.min(input.len())..end.min(input.len())];
+                let second =
+                    &output[start.saturating_sub(input.len())..end.saturating_sub(input.len())];
+                self.block_hashes.push(hash_block(parent, first, second));
+                continue;
+            }
+            // Unknown content remains reusable only by this execution after preemption.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            "opaque-kv".hash(&mut hasher);
+            self.cache_nonce.hash(&mut hasher);
+            parent.hash(&mut hasher);
+            index.hash(&mut hasher);
+            self.block_hashes.push(hasher.finish());
         }
     }
 
-    fn longest_cache_hit(&mut self, prefix_cache: &mut PrefixCache, block_size: u32) -> u32 {
+    fn longest_cache_hit(
+        &mut self,
+        prefix_cache: &mut PrefixCache,
+        block_size: u32,
+        recurrent: bool,
+    ) -> u32 {
         if self.effective_kv_tokens() != 0 {
             return self.shared_kv_tokens;
         }
@@ -180,7 +292,13 @@ impl RunningRequest {
             .block_hashes
             .len()
             .min((max_tokens / block_size) as usize);
-        prefix_cache.longest_hit(&self.block_hashes[..count]) as u32 * block_size
+        let hit = prefix_cache.longest_hit(&self.block_hashes[..count]);
+        let hit = if recurrent {
+            prefix_cache.checkpoint_hit(&self.block_hashes, hit)
+        } else {
+            hit
+        };
+        hit as u32 * block_size
     }
 
     fn publish_shared_prefix(&mut self, prefix_cache: &mut PrefixCache, block_size: u32) {
@@ -190,6 +308,9 @@ impl RunningRequest {
         let end = self.block_hashes.len().min((total / block_size) as usize);
         prefix_cache.insert(&self.block_hashes[start..end]);
         self.relock_shared_prefix(prefix_cache, block_size, end as u32 * block_size);
+        self.private_capacity_tokens = self
+            .private_capacity_tokens
+            .saturating_sub(u64::from(self.shared_kv_tokens - start as u32 * block_size));
         self.private_kv_tokens = total - self.shared_kv_tokens;
     }
 
@@ -209,19 +330,238 @@ impl RunningRequest {
         self.shared_kv_tokens = new_shared_kv_tokens;
     }
 
+    fn release_state_source(&mut self, prefix_cache: &mut PrefixCache) {
+        if let Some(hash) = self.state_hash.take() {
+            prefix_cache.unlock(&[hash]);
+        }
+    }
+
     fn preempt(&mut self, prefix_cache: &mut PrefixCache, block_size: u32) {
+        self.release_state_source(prefix_cache);
+        self.external_state_source = false;
         self.relock_shared_prefix(prefix_cache, block_size, 0);
-        self.private_kv_tokens = 0;
+        self.private_kv_tokens = self.external_kv_tokens;
+        self.private_capacity_tokens = u64::from(self.external_kv_tokens);
+        self.state_copies = 0;
     }
 }
 
 impl ChunkedPrefillScheduler {
+    fn private_bytes(&self, request: &RunningRequest) -> u64 {
+        request.private_kv_bytes(
+            self.block_size,
+            self.kv_bytes_per_request_per_device,
+            self.kv_bytes_per_token_per_device,
+        )
+    }
+
+    fn private_bytes_after(&self, request: &RunningRequest, tokens: u64, state_tokens: u64) -> u64 {
+        request.private_kv_bytes_after(
+            tokens,
+            state_tokens,
+            self.block_size,
+            self.kv_bytes_per_request_per_device,
+            self.kv_bytes_per_token_per_device,
+        )
+    }
+
+    fn hbm_bytes(&self) -> u64 {
+        self.model_weight_bytes_per_device
+            + self.external_kv_bytes
+            + self
+                .prefix_cache
+                .bytes_used(self.block_size, self.kv_bytes_per_token_per_device)
+            + self
+                .queue
+                .iter()
+                .map(|r| self.private_bytes(r))
+                .sum::<u64>()
+    }
+
     fn cache_block_bytes(&self) -> u64 {
         u64::from(self.block_size) * self.kv_bytes_per_token_per_device
     }
 }
 
 impl Scheduler for ChunkedPrefillScheduler {
+    fn external_kv_budget(&self) -> Result<u64> {
+        anyhow::ensure!(
+            self.external_kv_enabled,
+            "external KV ownership is not configured"
+        );
+        let private: u64 = self
+            .queue
+            .iter()
+            .map(|request| self.private_bytes(request))
+            .sum();
+        Ok(self
+            .usable_device_mem
+            .saturating_sub(self.model_weight_bytes_per_device)
+            .saturating_sub(private))
+    }
+    fn set_external_kv_reclaimable_bytes(&mut self, bytes: u64) {
+        self.external_kv_reclaimable_bytes = bytes;
+    }
+    fn set_external_admission_blocked(&mut self, request_id: u64, blocked: bool) {
+        if blocked {
+            self.external_admission.insert(request_id);
+        } else {
+            self.external_admission.remove(&request_id);
+        }
+    }
+    fn set_external_blocked(&mut self, request_id: u64, blocked: bool) {
+        if blocked {
+            self.external_blocked.insert(request_id);
+        } else {
+            self.external_blocked.remove(&request_id);
+        }
+    }
+
+    fn external_reclaim_pending(&self) -> bool {
+        self.external_reclaim.is_some()
+    }
+
+    fn adopt_external_state(&mut self, request_id: u64) {
+        if let Some(request) = self.queue.iter_mut().find(|r| r.request_id == request_id) {
+            request.state_copies = 0;
+            request.external_state_source = true;
+        }
+    }
+
+    fn take_external_preemptions(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.external_preemptions)
+    }
+
+    fn cancel_iteration(&mut self) {
+        self.running = false;
+        self.current_batch.clear();
+    }
+
+    fn restore_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        if let Some(request) = self.queue.iter_mut().find(|r| r.request_id == request_id) {
+            if request.effective_kv_tokens() == 0 {
+                anyhow::ensure!(
+                    tokens < request.known_tokens.max(1),
+                    "restored prefix must leave logits work"
+                );
+                request.external_kv_tokens = tokens;
+                request.private_kv_tokens = tokens;
+                request.private_capacity_tokens = u64::from(tokens);
+                request.state_copies = 0;
+                request.external_state_source =
+                    tokens > 0 && self.kv_bytes_per_request_per_device > 0;
+            }
+        }
+        Ok(())
+    }
+    fn take_kv_progress(&mut self) -> Vec<(u64, u32)> {
+        std::mem::take(&mut self.progress)
+    }
+
+    fn external_kv_requirement(&self) -> Option<(u64, u64)> {
+        if !self.external_kv_enabled || self.running {
+            return None;
+        }
+        if let Some(required) = self.external_reclaim {
+            return Some(required);
+        }
+        self.queue
+            .iter()
+            .find(|r| {
+                !self.external_blocked.contains(&r.request_id)
+                    && !self.external_admission.contains(&r.request_id)
+            })
+            .map(|r| {
+                let q = r
+                    .known_tokens
+                    .saturating_sub(r.effective_kv_tokens())
+                    .max(1);
+                let q = q.min(self.effective_max_num_batched_tokens);
+                (
+                    r.request_id,
+                    self.private_bytes_after(
+                        r,
+                        u64::from(q) + u64::from(self.num_lookahead_tokens),
+                        u64::from(q),
+                    ),
+                )
+            })
+            .filter(|(id, bytes)| {
+                self.queue
+                    .iter()
+                    .find(|r| r.request_id == *id)
+                    .is_some_and(|r| {
+                        !self.admitted.contains(&r.completion_node_id)
+                            || *bytes > self.private_bytes(r)
+                    })
+            })
+    }
+
+    fn adopt_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        for request in &mut self.queue {
+            if request.request_id == request_id {
+                anyhow::ensure!(
+                    tokens <= request.effective_kv_tokens(),
+                    "published KV exceeds computed progress"
+                );
+                request.external_kv_tokens = tokens;
+            }
+        }
+        Ok(())
+    }
+
+    fn configure_external_kv(&mut self) -> Result<KvMemoryInfo> {
+        anyhow::ensure!(
+            !self.enable_prefix_caching,
+            "externally owned KV requires child prefix caching disabled"
+        );
+        self.external_kv_enabled = true;
+        Ok(KvMemoryInfo {
+            compatibility: 0,
+            capacity_bytes: self
+                .usable_device_mem
+                .saturating_sub(self.model_weight_bytes_per_device),
+            block_tokens: self.block_size,
+            kv_bytes_per_token: self.kv_bytes_per_token_per_device,
+            kv_bytes_per_request: self.kv_bytes_per_request_per_device,
+        })
+    }
+
+    fn set_external_kv_bytes(&mut self, bytes: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.external_kv_enabled,
+            "external KV ownership is not configured"
+        );
+        let private_bytes: u64 = self
+            .queue
+            .iter()
+            .map(|request| self.private_bytes(request))
+            .sum();
+        anyhow::ensure!(
+            self.model_weight_bytes_per_device
+                .saturating_add(bytes)
+                .saturating_add(private_bytes)
+                <= self.usable_device_mem,
+            "external KV reservation exceeds available HBM: weights={}, external={bytes}, private={private_bytes}, capacity={}",
+            self.model_weight_bytes_per_device, self.usable_device_mem
+        );
+        self.external_kv_bytes = bytes;
+        Ok(())
+    }
+
+    fn reserve_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        anyhow::ensure!(
+            self.external_kv_enabled,
+            "external KV ownership is not configured"
+        );
+        anyhow::ensure!(
+            !self.external_prefixes.contains_key(&request_id),
+            "duplicate external prefix reservation"
+        );
+        self.external_prefixes.insert(request_id, tokens);
+        Ok(())
+    }
+
     fn init(
         &mut self,
         model_weight_bytes_per_device: u64,
@@ -270,117 +610,285 @@ impl Scheduler for ChunkedPrefillScheduler {
         if self.running || self.queue.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut batch_requests = Vec::new();
-        let mut total_q_len = 0_u32;
-        let block_size = self.block_size;
-        let kv_bytes_per_request_per_device = self.kv_bytes_per_request_per_device;
-        let kv_bytes_per_token_per_device = self.kv_bytes_per_token_per_device;
-        let usable_device_mem = self.usable_device_mem;
-        let enable_prefix_caching = self.enable_prefix_caching;
-        let cache_block_bytes = self.cache_block_bytes();
-        let prefix_cache = &mut self.prefix_cache;
+        self.external_reclaim = None;
+        self.admission_waiting.clear();
+        // External capacity waits retain the FCFS admission barrier. Transfer
+        // preparation can be skipped, but later new work cannot bypass HBM waits.
+        let capacity_wait = self
+            .queue
+            .iter()
+            .any(|r| self.external_admission.contains(&r.request_id));
+        let mut capacity_barrier = self.queue.iter().any(|r| {
+            self.external_admission.contains(&r.request_id)
+                && self.admitted.contains(&r.completion_node_id)
+        });
+        let mut capacity_suffix = HashSet::new();
+        for request in &self.queue {
+            capacity_barrier |= self.external_admission.contains(&request.request_id);
+            if capacity_barrier && !self.admitted.contains(&request.completion_node_id) {
+                capacity_suffix.insert(request.completion_node_id);
+            }
+        }
+        let (mut queue, blocked): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.queue).into_iter().partition(|r| {
+                !self.external_blocked.contains(&r.request_id)
+                    && !self.external_admission.contains(&r.request_id)
+            });
+        if queue.is_empty() {
+            self.queue = blocked.into_iter().collect();
+            return Ok(Vec::new());
+        }
+        let mut preempted = Vec::new();
+        let mut batch = Vec::new();
+        let mut budget = self.effective_max_num_batched_tokens;
         let mut gpu_bytes = self.model_weight_bytes_per_device
-            + prefix_cache.bytes_used(block_size, kv_bytes_per_token_per_device);
-
-        for request in self.queue.iter_mut() {
-            if batch_requests.len() >= self.effective_max_batch {
+            + self.external_kv_bytes
+            + self
+                .prefix_cache
+                .bytes_used(self.block_size, self.kv_bytes_per_token_per_device)
+            + queue
+                .iter()
+                .chain(&blocked)
+                .map(|r| self.private_bytes(r))
+                .sum::<u64>();
+        let mut index = 0;
+        while index < queue.len() && batch.len() < self.effective_max_batch && budget > 0 {
+            let is_running = self.admitted.contains(&queue[index].completion_node_id);
+            if !is_running && !preempted.is_empty() {
                 break;
             }
-
-            let remaining_batch_tokens = self
-                .effective_max_num_batched_tokens
-                .saturating_sub(total_q_len);
-            if remaining_batch_tokens == 0 {
+            if !is_running && capacity_suffix.contains(&queue[index].completion_node_id) {
+                self.admission_waiting
+                    .extend(queue[index..].iter().map(|r| r.completion_node_id));
                 break;
             }
-
+            let request = &mut queue[index];
             let original_shared = request.shared_kv_tokens;
-            let matched_shared = if enable_prefix_caching {
-                request.longest_cache_hit(prefix_cache, block_size)
+            let matched = if self.enable_prefix_caching {
+                request.longest_cache_hit(
+                    &mut self.prefix_cache,
+                    self.block_size,
+                    request.align_state,
+                )
             } else {
-                0
+                original_shared
             };
-            if matched_shared > original_shared {
-                request.relock_shared_prefix(prefix_cache, block_size, matched_shared);
-            }
-
-            let effective_kv_tokens = request.effective_kv_tokens();
-            let num_tokens = request
+            let state_key =
+                (request.align_state && matched > original_shared && request.state_hash.is_none())
+                    .then(|| {
+                        PrefixCache::checkpoint_key(
+                            request.block_hashes[(matched / self.block_size - 1) as usize],
+                        )
+                    });
+            let acquired_bytes = self.prefix_cache.reclaimable_bytes_for(
+                &request.block_hashes[(original_shared / self.block_size) as usize
+                    ..(matched / self.block_size) as usize],
+                self.cache_block_bytes(),
+            ) + state_key.map_or(0, |key| {
+                self.prefix_cache
+                    .reclaimable_bytes_for(&[key], self.cache_block_bytes())
+            });
+            // Price the prospective prefix without touching the free queue.
+            request.shared_kv_tokens = matched;
+            let mut q_len = request
                 .known_tokens
-                .saturating_sub(effective_kv_tokens)
-                .clamp(1, remaining_batch_tokens);
-            let needed_private_bytes = request.private_kv_bytes_after(
-                num_tokens,
-                block_size,
-                kv_bytes_per_request_per_device,
-                kv_bytes_per_token_per_device,
-            );
-
-            if enable_prefix_caching {
-                while gpu_bytes.saturating_add(needed_private_bytes) > usable_device_mem {
-                    if cache_block_bytes == 0 || !prefix_cache.evict_one() {
-                        request.relock_shared_prefix(prefix_cache, block_size, original_shared);
-                        break;
-                    }
-                    gpu_bytes = gpu_bytes.saturating_sub(cache_block_bytes);
+                .saturating_sub(request.effective_kv_tokens())
+                .clamp(1, budget);
+            if request.align_state {
+                let checkpoint = request.replay_checkpoint(self.block_size);
+                if request.effective_kv_tokens() < checkpoint
+                    && request.effective_kv_tokens() + q_len > checkpoint
+                {
+                    q_len = checkpoint - request.effective_kv_tokens();
                 }
-                if gpu_bytes.saturating_add(needed_private_bytes) > usable_device_mem {
+            }
+            let old = self.private_bytes(request);
+            let allocation = u64::from(q_len) + u64::from(self.num_lookahead_tokens);
+            let needed = self.private_bytes_after(request, allocation, u64::from(q_len));
+            let gate = if !is_running && self.scheduler_reserve_full_isl {
+                self.private_bytes_after(
+                    request,
+                    u64::from(
+                        request
+                            .known_tokens
+                            .saturating_sub(request.effective_kv_tokens())
+                            .max(1),
+                    ),
+                    u64::from(q_len),
+                )
+            } else {
+                needed
+            };
+            let available_cache = self
+                .prefix_cache
+                .reclaimable_bytes(self.cache_block_bytes())
+                .saturating_sub(acquired_bytes)
+                + self.external_kv_reclaimable_bytes;
+            if !is_running
+                && gpu_bytes
+                    .saturating_sub(old)
+                    .saturating_sub(available_cache)
+                    .saturating_add(gate.max(needed))
+                    > self.usable_device_mem
+            {
+                queue[index].shared_kv_tokens = original_shared;
+                self.admission_waiting
+                    .extend(queue[index..].iter().map(|r| r.completion_node_id));
+                break;
+            }
+            let request = &mut queue[index];
+            request.shared_kv_tokens = original_shared;
+            request.relock_shared_prefix(&mut self.prefix_cache, self.block_size, matched);
+            if let Some(key) = state_key {
+                self.prefix_cache.lock(&[key]);
+                request.state_hash = Some(key);
+            }
+            loop {
+                if gpu_bytes.saturating_sub(old).saturating_add(needed) <= self.usable_device_mem {
                     break;
                 }
-            } else if gpu_bytes.saturating_add(needed_private_bytes) > usable_device_mem {
-                request.relock_shared_prefix(prefix_cache, block_size, original_shared);
+                let before_cache = self
+                    .prefix_cache
+                    .bytes_used(self.block_size, self.kv_bytes_per_token_per_device);
+                if self.prefix_cache.evict_one() {
+                    let after_cache = self
+                        .prefix_cache
+                        .bytes_used(self.block_size, self.kv_bytes_per_token_per_device);
+                    gpu_bytes = gpu_bytes.saturating_sub(before_cache - after_cache);
+                    continue;
+                }
+                if self.external_kv_reclaimable_bytes > 0 {
+                    self.external_reclaim = Some((
+                        queue[index].request_id,
+                        gpu_bytes
+                            .saturating_sub(
+                                self.model_weight_bytes_per_device + self.external_kv_bytes + old,
+                            )
+                            .saturating_add(needed),
+                    ));
+                    break;
+                }
+                if !is_running {
+                    break;
+                }
+                let victim = (index..queue.len())
+                    .rev()
+                    .find(|&i| self.admitted.contains(&queue[i].completion_node_id));
+                let Some(victim) = victim else {
+                    break;
+                };
+                let mut request = queue.remove(victim);
+                gpu_bytes = gpu_bytes.saturating_sub(self.private_bytes(&request));
+                if self.external_kv_enabled {
+                    self.external_preemptions.push(request.request_id);
+                    request.external_kv_tokens = 0;
+                }
+                request.preempt(&mut self.prefix_cache, self.block_size);
+                gpu_bytes += self.private_bytes(&request);
+                self.admitted.remove(&request.completion_node_id);
+                self.preemptions_total += 1;
+                preempted.push(request);
+                if victim == index {
+                    break;
+                }
+            }
+            if self.external_reclaim.is_some() {
                 break;
             }
-
-            total_q_len += num_tokens;
-            gpu_bytes += needed_private_bytes;
+            if index >= queue.len()
+                || !is_running
+                    && gpu_bytes.saturating_sub(old).saturating_add(needed) > self.usable_device_mem
+            {
+                if index < queue.len() {
+                    queue[index].relock_shared_prefix(
+                        &mut self.prefix_cache,
+                        self.block_size,
+                        original_shared,
+                    );
+                    if original_shared == 0 {
+                        queue[index].release_state_source(&mut self.prefix_cache);
+                    }
+                    self.admission_waiting
+                        .extend(queue[index..].iter().map(|r| r.completion_node_id));
+                }
+                break;
+            }
+            if is_running && !self.admitted.contains(&queue[index].completion_node_id) {
+                break;
+            }
+            // The current running request may itself have been preempted.
+            if gpu_bytes.saturating_sub(old).saturating_add(needed) > self.usable_device_mem {
+                break;
+            }
+            let request = &mut queue[index];
+            gpu_bytes = gpu_bytes.saturating_sub(old) + needed;
+            request.state_copies = request.state_copies_after(u64::from(q_len), self.block_size);
+            request.private_capacity_tokens = u64::from(request.private_kv_tokens) + allocation;
             self.admitted.insert(request.completion_node_id);
-
-            batch_requests.push(RequestState {
-                q_len: num_tokens,
-                kv_len: effective_kv_tokens,
+            batch.push(RequestState {
+                q_len,
+                kv_len: request.effective_kv_tokens(),
                 lm_head_len: 1,
             });
+            budget -= q_len;
+            index += 1;
         }
-
-        if batch_requests.is_empty() {
-            bail!("system cannot handle a request!");
+        // V1 prepends each victim to waiting. Running requests retain FCFS order.
+        let split = queue
+            .iter()
+            .position(|r| !self.admitted.contains(&r.completion_node_id))
+            .unwrap_or(queue.len());
+        let waiting = queue.split_off(split);
+        queue.extend(preempted.into_iter().rev());
+        queue.extend(blocked);
+        queue.extend(waiting);
+        self.queue = queue.into_iter().collect();
+        if !self.external_preemptions.is_empty() || self.external_reclaim.is_some() {
+            return Ok(Vec::new());
         }
-
-        for request in self.queue.iter_mut().skip(batch_requests.len()) {
-            if request.effective_kv_tokens() == 0 {
-                break;
+        if batch.is_empty() {
+            if capacity_wait {
+                return Ok(Vec::new());
             }
-
-            let private_bytes = request.private_kv_bytes(
-                block_size,
-                kv_bytes_per_request_per_device,
-                kv_bytes_per_token_per_device,
-            );
-            if gpu_bytes.saturating_add(private_bytes) > usable_device_mem {
-                request.preempt(prefix_cache, block_size);
-                self.admitted.remove(&request.completion_node_id);
-            } else {
-                gpu_bytes += private_bytes;
-            }
+            bail!("request cannot fit currently known input and lookahead in available HBM");
         }
-
         self.running = true;
-        self.current_batch = batch_requests.clone();
-        Ok(batch_requests)
+        self.current_batch = batch.clone();
+        Ok(batch)
     }
 
     fn enqueue_sub_request(&mut self, request: ReadySubRequest) {
-        self.queue.push_back(RunningRequest::new(request));
+        let external = self
+            .external_prefixes
+            .remove(&request.request_id)
+            .unwrap_or(0);
+        assert!(
+            external <= request.kv_tokens,
+            "external prefix exceeds restored progress"
+        );
+        let mut running = RunningRequest::new(request);
+        running.align_state = self.kv_bytes_per_request_per_device > 0
+            && (self.enable_prefix_caching || self.external_kv_enabled);
+        running.cache_nonce = self.next_cache_nonce;
+        self.next_cache_nonce += 1;
+        running.external_kv_tokens = external;
+        if external > 0 && self.kv_bytes_per_request_per_device > 0 {
+            running.state_copies = 0;
+            running.external_state_source = true;
+        }
+        self.queue.push_back(running);
     }
 
     fn done_iteration(&mut self, now: f64) -> Vec<SubRequestCompletion> {
+        self.progress.clear();
         let current_batch = std::mem::take(&mut self.current_batch);
 
         let mut tail = self.queue.split_off(current_batch.len());
         for (request, scheduled) in self.queue.iter_mut().zip(&current_batch) {
+            let previous_tokens = request.effective_kv_tokens();
             request.private_kv_tokens += scheduled.q_len;
+            request.state_copies = 1;
+            request.release_state_source(&mut self.prefix_cache);
             if request.known_tokens <= request.effective_kv_tokens()
                 && request.known_tokens < request.input_tokens + request.output_tokens
             {
@@ -395,8 +903,30 @@ impl Scheduler for ChunkedPrefillScheduler {
                 request.known_tokens += 1;
             }
 
+            if self.external_kv_enabled
+                && (request.external_state_source
+                    || previous_tokens / self.block_size
+                        < request.effective_kv_tokens() / self.block_size)
+            {
+                self.progress
+                    .push((request.request_id, request.effective_kv_tokens()));
+                request.external_state_source = false;
+            }
             if self.enable_prefix_caching {
                 request.publish_shared_prefix(&mut self.prefix_cache, self.block_size);
+                let checkpoint = request.replay_checkpoint(self.block_size);
+                if self.kv_bytes_per_request_per_device > 0
+                    && checkpoint > 0
+                    && request.effective_kv_tokens() == checkpoint
+                {
+                    let key = self.prefix_cache.publish_checkpoint(
+                        request.block_hashes[(checkpoint / self.block_size - 1) as usize],
+                        self.kv_bytes_per_request_per_device,
+                    );
+                    self.prefix_cache.lock(&[key]);
+                    request.state_hash = Some(key);
+                    request.state_copies = 0;
+                }
             }
         }
 
@@ -406,6 +936,7 @@ impl Scheduler for ChunkedPrefillScheduler {
             let total_tokens = request.input_tokens + request.output_tokens;
             if request.known_tokens >= total_tokens {
                 self.admitted.remove(&request.completion_node_id);
+                request.release_state_source(&mut self.prefix_cache);
                 if self.enable_prefix_caching {
                     request.relock_shared_prefix(&mut self.prefix_cache, self.block_size, 0);
                 }
@@ -491,12 +1022,20 @@ mod tests {
             kv_tokens: 0,
             input_token_ids: Some((0..input).collect()),
             output_token_ids: None,
+            kv_prefix: None,
         }
     }
 
     fn state(scheduler: &ChunkedPrefillScheduler, running: u64, waiting: u64, generated: u64) {
         assert_eq!(
-            scheduler.observe(),
+            {
+                let value = scheduler.observe();
+                serde_json::json!({
+                    "running_requests": value["running_requests"],
+                    "waiting_requests": value["waiting_requests"],
+                    "generation_tokens_total": value["generation_tokens_total"],
+                })
+            },
             serde_json::json!({
                 "running_requests": running,
                 "waiting_requests": waiting,
@@ -536,6 +1075,66 @@ mod tests {
         scheduler.schedule().unwrap();
         scheduler.done_iteration(3.0);
         state(&scheduler, 0, 0, 2);
+    }
+
+    #[test]
+    fn external_prefix_has_one_memory_owner_and_keeps_progress() {
+        let mut scheduler = scheduler(4, false);
+        scheduler.usable_device_mem = 12;
+        assert_eq!(
+            scheduler.configure_external_kv().unwrap().capacity_bytes,
+            12
+        );
+        scheduler.set_external_kv_bytes(8).unwrap();
+        scheduler.reserve_external_prefix(0, 8).unwrap();
+        let mut seeded = request(12, 1);
+        seeded.kv_tokens = 8;
+        scheduler.enqueue_sub_request(seeded);
+        let batch = scheduler.schedule().unwrap();
+        assert_eq!((batch[0].kv_len, batch[0].q_len), (8, 4));
+        assert!(scheduler.set_external_kv_bytes(9).is_err());
+        assert_eq!(scheduler.done_iteration(1.0).len(), 1);
+        scheduler.set_external_kv_bytes(12).unwrap();
+        scheduler.enqueue_sub_request(request(4, 1));
+        assert!(scheduler.schedule().is_err());
+        scheduler.set_external_kv_bytes(8).unwrap();
+        assert_eq!(scheduler.schedule().unwrap()[0].q_len, 4);
+    }
+
+    #[test]
+    fn partial_external_block_charges_the_remaining_slots_before_admission() {
+        // Five restored tokens plus one new token occupy two four-token blocks.
+        // With one byte/token, seven bytes cannot admit it; eight can.
+        for capacity in [7, 8] {
+            let mut scheduler = scheduler(4, false);
+            scheduler.usable_device_mem = capacity;
+            scheduler.configure_external_kv().unwrap();
+            scheduler.set_external_kv_bytes(5).unwrap();
+            scheduler.reserve_external_prefix(0, 5).unwrap();
+            let mut seeded = request(6, 1);
+            seeded.kv_tokens = 5;
+            scheduler.enqueue_sub_request(seeded);
+            let batch = scheduler.schedule();
+            if capacity == 7 {
+                assert!(batch.is_err());
+            } else {
+                let batch = batch.unwrap();
+                assert_eq!((batch[0].kv_len, batch[0].q_len), (5, 1));
+                assert_eq!(scheduler.done_iteration(1.0).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn external_prefix_survives_preemption_and_rejects_private_cache() {
+        let mut running = RunningRequest::new(request(12, 3));
+        running.private_kv_tokens = 12;
+        running.external_kv_tokens = 8;
+        running.preempt(&mut PrefixCache::default(), 4);
+        assert_eq!(running.effective_kv_tokens(), 8);
+        assert_eq!(running.private_kv_bytes(4, 0, 1), 0);
+        assert_eq!(running.private_kv_bytes_after(4, 4, 4, 0, 1), 4);
+        assert!(scheduler(4, true).configure_external_kv().is_err());
     }
 
     #[test]
@@ -692,7 +1291,7 @@ mod tests {
         assert_eq!(request.effective_kv_tokens(), 0);
         assert_eq!(request.block_hashes, hashes);
         assert!(cache.evict_one());
-        assert_eq!(request.longest_cache_hit(&mut cache, 4), 8);
+        assert_eq!(request.longest_cache_hit(&mut cache, 4, false), 8);
         request.relock_shared_prefix(&mut cache, 4, 8);
         request.private_kv_tokens = 4;
         request.publish_shared_prefix(&mut cache, 4);
@@ -702,7 +1301,7 @@ mod tests {
         for _ in 0..3 {
             assert!(cache.evict_one());
         }
-        assert_eq!(request.longest_cache_hit(&mut cache, 4), 0);
+        assert_eq!(request.longest_cache_hit(&mut cache, 4, false), 0);
     }
 
     #[test]
@@ -725,18 +1324,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_output_ids_preserve_only_the_known_prompt_blocks() {
+    fn missing_output_ids_retain_execution_scoped_opaque_blocks() {
         let mut request = RunningRequest::new(request(6, 8));
         let mut cache = PrefixCache::default();
         request.private_kv_tokens = 12;
         request.publish_shared_prefix(&mut cache, 4);
-        assert_eq!(request.shared_kv_tokens, 4);
-        assert_eq!(request.private_kv_tokens, 8);
-        assert_eq!(request.block_hashes.len(), 1);
+        assert_eq!(request.shared_kv_tokens, 12);
+        assert_eq!(request.private_kv_tokens, 0);
+        assert_eq!(request.block_hashes.len(), 3);
     }
 
     #[test]
-    fn disabled_caching_or_missing_prompt_ids_creates_no_hashes() {
+    fn unknown_prompt_blocks_are_retained_only_when_caching_is_enabled() {
         for enabled in [false, true] {
             let mut scheduler = scheduler(4, enabled);
             let mut input = request(8, 1);
@@ -747,8 +1346,14 @@ mod tests {
             scheduler.enqueue_sub_request(input);
             scheduler.schedule().unwrap();
             scheduler.done_iteration(1.0);
-            assert!(scheduler.queue.front().unwrap().block_hashes.is_empty());
-            assert_eq!(scheduler.prefix_cache.bytes_used(4, 1), 0);
+            assert_eq!(
+                scheduler.queue.front().unwrap().block_hashes.is_empty(),
+                !enabled
+            );
+            assert_eq!(
+                scheduler.prefix_cache.bytes_used(4, 1),
+                if enabled { 4 } else { 0 }
+            );
         }
     }
 

@@ -62,8 +62,9 @@ own all serving semantics and reach the engine only through graph nodes.
 - A `System` owns request lifecycle: seeding request DAGs, splicing in work,
   completion accounting, and composition into multi-instance and disaggregated
   topologies; see [serving systems](architectures/systems.md).
-- A `Scheduler` owns ready LLM work, batch admission, KV memory, and its
-  prefix cache. A `Router` owns whole-request placement; see
+- A `Scheduler` owns ready LLM work, FCFS admission, incremental KV allocation,
+  preemption and its local prefix cache. An external KV parent owns shared
+  content, replicas and transfer dependencies. A `Router` owns placement; see
   [scheduling](architectures/scheduling.md).
 - A `Model` owns the layer plan and memory footprint for a parallel strategy.
   A `ModelRunner` owns one parallelism axis and expands a batch into compute
@@ -83,6 +84,10 @@ own all serving semantics and reach the engine only through graph nodes.
   simulation path; see [validation](architectures/validation.md).
 - Components expose read-only state; the engine supplies observation times and
   the CLI writes optional JSONL traces. See [observability](architectures/observability.md).
+
+KV identity is independent of ownership and storage location. Completed calls
+release execution references while unreferenced cached content remains reclaimable.
+Hybrid reuse additionally requires a counted recurrent-state checkpoint.
 
 Detailed contracts:
 
@@ -119,7 +124,8 @@ loads. Routed children enter the graph beneath that arrival event.
 
 - Workload JSONL is the only input format: one request DAG per row. Each LLM
   sub-request carries its own full context; runtime never reconstructs context
-  from predecessors.
+  from predecessors. Optional token traces or namespaced full-block identities
+  prove reusable input; generated KV does not implicitly identify a later input.
 - Result JSONL repeats the input DAG and adds one `token_latency` array per LLM
   sub-request: TTFT first, then inter-token latencies.
 - A scenario is one TOML tree whose `kind` fields select registered

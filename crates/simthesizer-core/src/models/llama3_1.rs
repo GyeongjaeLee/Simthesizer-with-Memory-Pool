@@ -365,6 +365,7 @@ mod tests {
                 kv_tokens: 0,
                 input_token_ids: None,
                 output_token_ids: None,
+                kv_prefix: None,
             });
         }
         assert_eq!(scheduler.schedule().unwrap().len(), 1);

@@ -91,7 +91,7 @@ fn run(
     let engine = Engine::new(graph, system);
     let result = if observed {
         engine.run_with_observer(|time, system| {
-            frames.push((time, system.observe()));
+            frames.push((time, lifecycle_counters(system.observe())));
             Ok(())
         })
     } else {
@@ -99,6 +99,32 @@ fn run(
     }
     .unwrap();
     (result, frames)
+}
+
+// These regressions compare request lifecycle counters; KV metrics have separate checks.
+fn lifecycle_counters(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("generation_tokens_total") {
+            object.retain(|key, _| {
+                [
+                    "running_requests",
+                    "waiting_requests",
+                    "generation_tokens_total",
+                ]
+                .contains(&key.as_str())
+            });
+        } else {
+            object.remove("iteration_active");
+            for child in object.values_mut() {
+                *child = lifecycle_counters(child.take());
+            }
+        }
+    } else if let Some(array) = value.as_array_mut() {
+        for child in array {
+            *child = lifecycle_counters(child.take());
+        }
+    }
+    value
 }
 
 fn state(running: u64, waiting: u64, tokens: u64) -> Value {

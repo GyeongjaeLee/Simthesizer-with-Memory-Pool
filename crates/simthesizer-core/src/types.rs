@@ -4,6 +4,22 @@ use serde::{Deserialize, Serialize};
 pub type NodeID = u64;
 pub type NetworkDeviceID = u64;
 
+/// Input-only identities supplied by a trace, never inferred from token counts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvPrefix {
+    pub namespace: String,
+    pub block_tokens: u32,
+    pub block_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTokens {
+    pub prompt: u32,
+    pub completion: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Layer {
     Embedding {
@@ -108,6 +124,10 @@ impl Request {
             "requests must contain at least one sub-request"
         );
         for (subrequest_index, sub_request) in self.sub_requests.iter().enumerate() {
+            ensure!(
+                sub_request.session_id().is_none_or(|id| !id.is_empty()),
+                "session_id must not be empty"
+            );
             for (name, value) in [
                 ("interval", sub_request.interval()),
                 ("duration", sub_request.duration()),
@@ -124,12 +144,43 @@ impl Request {
                 output_tokens,
                 known_tokens,
                 kv_tokens,
+                kv_prefix,
+                input_token_ids,
+                output_token_ids,
                 ..
             } = sub_request
             {
                 let total_tokens = input_tokens.checked_add(*output_tokens).ok_or_else(|| {
                     anyhow::anyhow!("llm sub-request {subrequest_index} token count exceeds u32")
                 })?;
+                for (name, ids, count) in [
+                    ("input_token_ids", input_token_ids, input_tokens),
+                    ("output_token_ids", output_token_ids, output_tokens),
+                ] {
+                    ensure!(
+                        ids.as_ref().is_none_or(|ids| ids.len() == *count as usize),
+                        "{name} length differs from token count"
+                    );
+                }
+                if let Some(prefix) = kv_prefix {
+                    ensure!(
+                        !prefix.namespace.is_empty(),
+                        "KV namespace must not be empty"
+                    );
+                    ensure!(
+                        prefix.block_tokens > 0,
+                        "KV identity block size must be positive"
+                    );
+                    ensure!(
+                        input_token_ids.is_none(),
+                        "choose token IDs or proxy KV identities"
+                    );
+                    ensure!(
+                        prefix.block_ids.len() as u64 * u64::from(prefix.block_tokens)
+                            <= u64::from(*input_tokens),
+                        "KV identities exceed the input length"
+                    );
+                }
                 match (known_tokens, kv_tokens) {
                     (Some(known_tokens), Some(kv_tokens)) => {
                         ensure!(
@@ -179,6 +230,9 @@ pub enum SubRequest {
         model: Option<String>,
         input_token_ids: Option<Vec<u32>>,
         output_token_ids: Option<Vec<u32>>,
+        kv_prefix: Option<KvPrefix>,
+        session_id: Option<String>,
+        provider_tokens: Option<ProviderTokens>,
     },
     ToolCall {
         input_tokens: u32,
@@ -186,10 +240,35 @@ pub enum SubRequest {
         next: Vec<usize>,
         duration: Option<f64>,
         interval: Option<f64>,
+        session_id: Option<String>,
     },
 }
 
 impl SubRequest {
+    pub fn kv_prefix(&self) -> Option<&KvPrefix> {
+        match self {
+            Self::Llm { kv_prefix, .. } => kv_prefix.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Llm { session_id, .. } | Self::ToolCall { session_id, .. } => {
+                session_id.as_deref()
+            }
+        }
+    }
+
+    pub fn provider_tokens(&self) -> Option<&ProviderTokens> {
+        match self {
+            Self::Llm {
+                provider_tokens, ..
+            } => provider_tokens.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn kind(&self) -> SubRequestKind {
         match self {
             Self::Llm { .. } => SubRequestKind::Llm,
@@ -282,6 +361,7 @@ pub struct ReadySubRequest {
     pub kv_tokens: u32,
     pub input_token_ids: Option<Vec<u32>>,
     pub output_token_ids: Option<Vec<u32>>,
+    pub kv_prefix: Option<KvPrefix>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -350,6 +430,12 @@ pub enum ResultSubRequest {
         token_latency: Vec<f64>,
         interval: Option<f64>,
         model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_tokens: Option<ProviderTokens>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_prefix: Option<KvPrefix>,
     },
     ToolCall {
         input_tokens: u32,
@@ -357,6 +443,8 @@ pub enum ResultSubRequest {
         next: Vec<usize>,
         duration: f64,
         interval: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
 }
 

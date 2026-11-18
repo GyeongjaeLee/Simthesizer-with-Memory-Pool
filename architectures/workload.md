@@ -24,8 +24,15 @@ runner. Result JSONL is the shared output. Both hold one request DAG per row.
 Each `llm` sub-request is self-contained. `input_tokens` is the full prompt of
 that step, and optional `input_token_ids` / `output_token_ids` are that step's
 own token trace. Runtime never derives context or KV lineage from predecessor
-completions; reuse across steps is found by the prefix cache from token IDs
-alone. Request-level token counts do not exist.
+completions. Prefix identity comes from token IDs or an explicit `kv_prefix`
+(`namespace`, `block_tokens`, ordered unsigned 64-bit `block_ids`), never both.
+The namespace identifies compatible model/layout and sharing scope; reuse
+requires a continuous matching prefix. Request-level token counts do not exist.
+
+Optional `session_id` on LLM and tool nodes records ownership, independently of
+prefix identity and physical storage. Tools and terminal joins keep session
+membership alive through their completion. Optional `provider_tokens` preserves
+original `prompt` and `completion` counts without overriding native work sizes.
 
 Optional seeded progress (`known_tokens`, `kv_tokens`) is set together on an
 `llm` sub-request so that a system can start a synthetic child mid-generation,

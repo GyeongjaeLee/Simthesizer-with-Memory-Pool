@@ -80,6 +80,14 @@ has one scheduler for all ranks: request KV/state costs are averaged across
 ranks, and batch limits scale with `ep`. The second has one scheduler per rank,
 with raw per-device memory.
 
+External KV ownership exposes physical memory per consuming rank. TP workers
+restore every rank's model-defined shard, including replicated KV heads; their
+shared scheduler reserves the maximum occupied rank. EP workers use
+`moe_ep_multi_instance`: its router selects the attention rank before reload,
+counts the reserved request in load, and retains that selection at arrival.
+Each EP scheduler reserves its own KV bytes. Aggregate `single_instance` EP
+has no stable rank-local owner and cannot accept external KV.
+
 ## Evolution Rules
 
 - Build a new topology by composing systems through seeding and sinks before

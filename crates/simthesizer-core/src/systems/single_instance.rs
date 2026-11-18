@@ -19,6 +19,8 @@ use crate::types::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SingleInstanceSystem {
+    #[serde(skip)]
+    kv_capacity_event: Option<NodeID>,
     model_runner: Box<dyn ModelRunner>,
     model: Box<dyn Model>,
     scheduler: Box<dyn Scheduler>,
@@ -78,6 +80,8 @@ enum LogicalPayload {
         subrequest_index: usize,
         completion_node_id: NodeID,
     },
+    LlmCapacityReady,
+    LlmPrepareSchedule,
     LlmSchedule,
     LlmBatchComplete,
     ToolCallRun {
@@ -171,6 +175,9 @@ impl SingleInstanceSystem {
                         token_latency: completion.token_latency.clone(),
                         interval: *interval,
                         model: model.clone(),
+                        session_id: sub_request.session_id().map(str::to_owned),
+                        provider_tokens: sub_request.provider_tokens().cloned(),
+                        kv_prefix: sub_request.kv_prefix().cloned(),
                     },
                     SubRequest::ToolCall {
                         input_tokens,
@@ -178,12 +185,14 @@ impl SingleInstanceSystem {
                         next,
                         duration,
                         interval,
+                        session_id,
                     } => ResultSubRequest::ToolCall {
                         input_tokens: *input_tokens,
                         output_tokens: *output_tokens,
                         next: next.clone(),
                         duration: duration.unwrap_or(0.0),
                         interval: *interval,
+                        session_id: session_id.clone(),
                     },
                 })
             })
@@ -321,6 +330,7 @@ impl LogicalHandler for SingleInstanceSystem {
                     output_token_ids,
                     known_tokens,
                     kv_tokens,
+                    kv_prefix,
                 ) = {
                     let active = self
                         .active_requests
@@ -353,6 +363,7 @@ impl LogicalHandler for SingleInstanceSystem {
                         output_token_ids.clone(),
                         known_tokens,
                         kv_tokens,
+                        sub_request.kv_prefix().cloned(),
                     )
                 };
                 self.scheduler.enqueue_sub_request(ReadySubRequest {
@@ -366,13 +377,66 @@ impl LogicalHandler for SingleInstanceSystem {
                     kv_tokens,
                     input_token_ids,
                     output_token_ids,
+                    kv_prefix,
                 });
-                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
                 graph.add_edge(current, schedule)?;
+                Ok(0.0)
+            }
+            LogicalPayload::LlmCapacityReady => {
+                if self.kv_capacity_event == Some(current) {
+                    self.kv_capacity_event = None;
+                }
+                Ok(0.0)
+            }
+            LogicalPayload::LlmPrepareSchedule => {
+                if let Some(capacity) = self.kv_capacity_event {
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(current, retry)?;
+                    graph.add_edge(capacity, retry)?;
+                    return Ok(0.0);
+                }
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
+                let mut previous = current;
+                if let Some((request_id, required_bytes)) = self.scheduler.external_kv_requirement()
+                {
+                    if let Some(&sink) = self.request_sinks.get(&request_id) {
+                        let ranks =
+                            (0..self.model_runner.parallel_strategy().tp as usize).collect();
+                        let event = graph.add_logical_node(
+                            sink,
+                            SystemEvent::KvCapacity {
+                                request_id,
+                                ranks,
+                                required_bytes,
+                                continuation: schedule,
+                            },
+                        );
+                        graph.add_edge(previous, event)?;
+                        previous = event;
+                    }
+                }
+                graph.add_edge(previous, schedule)?;
                 Ok(0.0)
             }
             LogicalPayload::LlmSchedule => {
                 let batch_requests = self.scheduler.schedule()?;
+                let preemptions = self.scheduler.take_external_preemptions();
+                if !preemptions.is_empty() || self.scheduler.external_reclaim_pending() {
+                    self.scheduler.cancel_iteration();
+                    let mut previous = current;
+                    for request_id in preemptions {
+                        if let Some(&sink) = self.request_sinks.get(&request_id) {
+                            let event = graph
+                                .add_logical_node(sink, SystemEvent::KvPreempted { request_id });
+                            graph.add_edge(previous, event)?;
+                            previous = event;
+                        }
+                    }
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(previous, retry)?;
+                    return Ok(0.0);
+                }
                 if batch_requests.is_empty() {
                     return Ok(0.0);
                 }
@@ -385,18 +449,40 @@ impl LogicalHandler for SingleInstanceSystem {
 
                 let complete = graph.add_logical_node(module, LogicalPayload::LlmBatchComplete);
                 graph.add_edge(last_node, complete)?;
+                let capacity = graph.add_logical_node(module, LogicalPayload::LlmCapacityReady);
+                graph.add_edge(complete, capacity)?;
+                self.kv_capacity_event = Some(capacity);
 
                 Ok(0.0)
             }
             LogicalPayload::LlmBatchComplete => {
-                for completion in self.scheduler.done_iteration(now) {
+                let completions = self.scheduler.done_iteration(now);
+                let mut previous = current;
+                for (request_id, computed_tokens) in self.scheduler.take_kv_progress() {
+                    if let Some(&sink) = self.request_sinks.get(&request_id) {
+                        let event = graph.add_logical_node(
+                            sink,
+                            SystemEvent::KvProgress {
+                                request_id,
+                                computed_tokens,
+                            },
+                        );
+                        graph.add_edge(previous, event)?;
+                        previous = event;
+                    }
+                }
+                for completion in completions {
                     let completion_node_id = completion.completion_node_id;
                     self.queue_completion(completion_node_id, completion)?;
-                    graph.add_edge(current, completion_node_id)?;
+                    graph.add_edge(previous, completion_node_id)?;
                 }
 
-                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
-                graph.add_edge(current, schedule)?;
+                let capacity = self.kv_capacity_event.expect("active batch capacity fence");
+                if previous != current {
+                    graph.add_edge(previous, capacity)?;
+                }
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                graph.add_edge(capacity, schedule)?;
                 Ok(0.0)
             }
             LogicalPayload::ToolCallRun { duration } => Ok(duration),
@@ -423,6 +509,103 @@ impl Module for SingleInstanceSystem {
 }
 
 impl System for SingleInstanceSystem {
+    fn next_kv_capacity_event(&self, rank: usize) -> Option<NodeID> {
+        (rank < self.model_runner.parallel_strategy().tp as usize)
+            .then_some(self.kv_capacity_event)
+            .flatten()
+    }
+    fn external_kv_budget(&self, rank: usize) -> Result<u64> {
+        anyhow::ensure!(
+            rank < self.model_runner.parallel_strategy().tp as usize,
+            "invalid external KV rank"
+        );
+        self.scheduler.external_kv_budget()
+    }
+    fn adopt_external_state(&mut self, request_id: u64) -> Result<()> {
+        self.scheduler.adopt_external_state(request_id);
+        Ok(())
+    }
+    fn set_external_admission_blocked(&mut self, request_id: u64, blocked: bool) -> Result<()> {
+        self.scheduler
+            .set_external_admission_blocked(request_id, blocked);
+        Ok(())
+    }
+    fn set_external_kv_reclaimable_bytes(&mut self, bytes: &[u64]) -> Result<()> {
+        self.scheduler
+            .set_external_kv_reclaimable_bytes(bytes.iter().copied().min().unwrap_or(0));
+        Ok(())
+    }
+    fn set_external_blocked(&mut self, request_id: u64, blocked: bool) -> Result<()> {
+        self.scheduler.set_external_blocked(request_id, blocked);
+        Ok(())
+    }
+    fn external_kv_requirement(&self, ranks: &[usize]) -> Option<(u64, u64)> {
+        let _ = ranks;
+        self.scheduler.external_kv_requirement()
+    }
+    fn restore_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        self.scheduler.restore_external_prefix(request_id, tokens)
+    }
+
+    fn adopt_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        self.scheduler.adopt_external_prefix(request_id, tokens)
+    }
+
+    fn configure_external_kv_ranks(&mut self) -> Result<Vec<crate::scheduler::KvMemoryInfo>> {
+        let parallel = self.model_runner.parallel_strategy();
+        anyhow::ensure!(
+            parallel.tp > 0 && parallel.pp == 1,
+            "external KV requires PP=1"
+        );
+        anyhow::ensure!(
+            parallel.ep == 1,
+            "single_instance EP has no rank-local KV owner; use moe_ep_multi_instance for external KV"
+        );
+        let mut memory = self.scheduler.configure_external_kv()?;
+        memory.compatibility = self.model.kv_compatibility();
+        memory.kv_bytes_per_token = self.model.kv_bytes_per_token_per_device();
+        memory.kv_bytes_per_request = self.model.kv_bytes_per_request_per_device();
+        Ok(vec![memory; parallel.tp as usize])
+    }
+
+    fn set_external_kv_rank_bytes(&mut self, bytes: &[u64]) -> Result<()> {
+        let parallel = self.model_runner.parallel_strategy();
+        anyhow::ensure!(
+            parallel.ep == 1 && bytes.len() == parallel.tp as usize,
+            "external KV reservation must name every TP rank"
+        );
+        self.scheduler
+            .set_external_kv_bytes(bytes.iter().copied().max().unwrap_or(0))
+    }
+
+    fn reserve_external_kv_request(&mut self, _request: &Request) -> Result<Vec<usize>> {
+        let parallel = self.model_runner.parallel_strategy();
+        anyhow::ensure!(
+            parallel.ep == 1,
+            "external KV requires rank-local attention"
+        );
+        Ok((0..parallel.tp as usize).collect())
+    }
+
+    fn configure_external_kv(&mut self) -> Result<crate::scheduler::KvMemoryInfo> {
+        let parallel = self.model_runner.parallel_strategy();
+        anyhow::ensure!(
+            parallel.tp == 1 && parallel.pp == 1 && parallel.ep == 1,
+            "externally owned KV requires TP=PP=EP=1"
+        );
+        let mut memory = self.scheduler.configure_external_kv()?;
+        memory.compatibility = self.model.kv_compatibility();
+        Ok(memory)
+    }
+
+    fn set_external_kv_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.scheduler.set_external_kv_bytes(bytes)
+    }
+
+    fn reserve_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        self.scheduler.reserve_external_prefix(request_id, tokens)
+    }
+
     fn instance_load(&self) -> InstanceLoad {
         std::iter::once(self.scheduler.instance_load())
             .chain(

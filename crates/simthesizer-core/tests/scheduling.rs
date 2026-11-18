@@ -33,6 +33,7 @@ fn request(id: u64, input: u32, output: u32) -> ReadySubRequest {
         kv_tokens: 0,
         input_token_ids: None,
         output_token_ids: None,
+        kv_prefix: None,
     }
 }
 

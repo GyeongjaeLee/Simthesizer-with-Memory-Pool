@@ -6,6 +6,7 @@ struct BlockEntry {
     ref_count: u32,
     lru_prev: Option<u64>,
     lru_next: Option<u64>,
+    checkpoint_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -13,20 +14,83 @@ pub struct PrefixCache {
     cache: HashMap<u64, BlockEntry>,
     lru_head: Option<u64>,
     lru_tail: Option<u64>,
+    reclaimable: usize,
+    checkpoint_bytes: u64,
+    checkpoint_count: usize,
+    reclaimable_checkpoint_bytes: u64,
+    reclaimable_checkpoint_count: usize,
 }
 
 impl PrefixCache {
-    pub fn bytes_used(&self, block_size: u32, kv_bytes_per_token_per_device: u64) -> u64 {
-        self.cache.len() as u64 * u64::from(block_size) * kv_bytes_per_token_per_device
+    pub fn reclaimable_bytes(&self, block_bytes: u64) -> u64 {
+        (self.reclaimable - self.reclaimable_checkpoint_count) as u64 * block_bytes
+            + self.reclaimable_checkpoint_bytes
     }
 
-    pub fn longest_hit(&mut self, hashes: &[u64]) -> usize {
+    pub fn reclaimable_bytes_for(&self, hashes: &[u64], block_bytes: u64) -> u64 {
+        hashes
+            .iter()
+            .map(|hash| {
+                let entry = &self.cache[hash];
+                if entry.ref_count != 0 {
+                    0
+                } else if entry.checkpoint_bytes > 0 {
+                    entry.checkpoint_bytes
+                } else {
+                    block_bytes
+                }
+            })
+            .sum()
+    }
+
+    pub fn checkpoint_key(hash: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "recurrent-state".hash(&mut hasher);
+        hash.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn checkpoint_hit(&self, hashes: &[u64], hit: usize) -> usize {
+        (0..hit)
+            .rev()
+            .find(|&index| {
+                self.cache
+                    .contains_key(&Self::checkpoint_key(hashes[index]))
+            })
+            .map_or(0, |index| index + 1)
+    }
+
+    pub fn publish_checkpoint(&mut self, hash: u64, bytes: u64) -> u64 {
+        let key = Self::checkpoint_key(hash);
+        if let Entry::Vacant(entry) = self.cache.entry(key) {
+            entry.insert(BlockEntry {
+                ref_count: 0,
+                lru_prev: None,
+                lru_next: None,
+                checkpoint_bytes: bytes,
+            });
+            self.checkpoint_bytes += bytes;
+            self.checkpoint_count += 1;
+            self.lru_push_back(key);
+        } else {
+            self.touch(key);
+        }
+        key
+    }
+
+    pub fn bytes_used(&self, block_size: u32, kv_bytes_per_token_per_device: u64) -> u64 {
+        (self.cache.len() - self.checkpoint_count) as u64
+            * u64::from(block_size)
+            * kv_bytes_per_token_per_device
+            + self.checkpoint_bytes
+    }
+
+    pub fn longest_hit(&self, hashes: &[u64]) -> usize {
         let mut count = 0;
         for &h in hashes {
             if !self.cache.contains_key(&h) {
                 break;
             }
-            self.touch(h);
             count += 1;
         }
         count
@@ -39,6 +103,7 @@ impl PrefixCache {
                     ref_count: 0,
                     lru_prev: None,
                     lru_next: None,
+                    checkpoint_bytes: 0,
                 });
                 self.lru_push_back(h);
             } else {
@@ -73,7 +138,9 @@ impl PrefixCache {
             return false;
         };
         self.lru_remove(h);
-        self.cache.remove(&h);
+        let removed = self.cache.remove(&h).unwrap();
+        self.checkpoint_bytes -= removed.checkpoint_bytes;
+        self.checkpoint_count -= usize::from(removed.checkpoint_bytes > 0);
         true
     }
 
@@ -85,6 +152,9 @@ impl PrefixCache {
     }
 
     fn lru_push_back(&mut self, h: u64) {
+        self.reclaimable += 1;
+        self.reclaimable_checkpoint_bytes += self.cache[&h].checkpoint_bytes;
+        self.reclaimable_checkpoint_count += usize::from(self.cache[&h].checkpoint_bytes > 0);
         let entry = self.cache.get_mut(&h).unwrap();
         entry.lru_prev = self.lru_tail;
         entry.lru_next = None;
@@ -98,6 +168,9 @@ impl PrefixCache {
     }
 
     fn lru_remove(&mut self, h: u64) {
+        self.reclaimable -= 1;
+        self.reclaimable_checkpoint_bytes -= self.cache[&h].checkpoint_bytes;
+        self.reclaimable_checkpoint_count -= usize::from(self.cache[&h].checkpoint_bytes > 0);
         let entry = self.cache.get_mut(&h).unwrap();
         let prev = entry.lru_prev.take();
         let next = entry.lru_next.take();
@@ -216,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_on_hit_updates_lru_order() {
+    fn lookup_alone_does_not_change_free_queue_order() {
         let mut cache = PrefixCache::default();
         let a = tokens(16);
         let b: Vec<u32> = (100..116).collect();
@@ -227,8 +300,8 @@ mod tests {
         hit(&mut cache, &a);
 
         assert!(cache.evict_one());
-        assert_eq!(hit(&mut cache, &a), 16);
-        assert_eq!(hit(&mut cache, &b), 0);
+        assert_eq!(hit(&mut cache, &a), 0);
+        assert_eq!(hit(&mut cache, &b), 16);
     }
 
     #[test]

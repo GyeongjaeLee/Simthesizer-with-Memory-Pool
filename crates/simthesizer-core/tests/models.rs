@@ -39,6 +39,7 @@ fn ep_scheduler_reserves_full_resident_weights_before_request_state() {
                     kv_tokens: 0,
                     input_token_ids: None,
                     output_token_ids: None,
+                    kv_prefix: None,
                 });
             }
             if fits {

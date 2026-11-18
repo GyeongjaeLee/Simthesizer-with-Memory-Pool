@@ -190,6 +190,40 @@ class MetricsTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_tool_session_membership_is_validated_and_compared(self):
+        tool = {"kind": "tool_call", "input_tokens": 0, "output_tokens": 0,
+                "duration": 3, "next": [], "session_id": "session"}
+        reference = run(request([tool]))
+        self.assertEqual(reference.requests[0]["sub_requests"][0]["session_id"], "session")
+        for invalid in ("", 1, []):
+            with self.subTest(session_id=invalid), self.assertRaisesRegex(ValueError, "session_id"):
+                run(request([{**tool, "session_id": invalid}]))
+        with self.assertRaisesRegex(ValueError, "session_id"):
+            match_runs(reference, run(request([{**tool, "session_id": "other"}])))
+
+    def test_kv_identity_validation_and_comparison(self):
+        prefix = {"namespace": "scope", "block_tokens": 2, "block_ids": [1, 2]}
+        metadata = {"kv_prefix": prefix, "session_id": "s", "provider_tokens": {"prompt": 9, "completion": 1}}
+        reference = run(request([llm([1], **metadata)]))
+        match_runs(reference, run(request([llm([2], **metadata)])))
+        for field in metadata:
+            changed = copy.deepcopy(metadata)
+            del changed[field]
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                match_runs(reference, run(request([llm([2], **changed)])))
+        for invalid in (
+                {**prefix, "namespace": ""}, {**prefix, "block_tokens": 0},
+                {**prefix, "block_tokens": 3}, {**prefix, "block_ids": [2**64]},
+                {**prefix, "block_ids": [True]}, {**prefix, "block_ids": ["1"]}):
+            with self.subTest(prefix=invalid), self.assertRaises(ValueError):
+                run(request([llm([1], kv_prefix=invalid)]))
+        with self.assertRaisesRegex(ValueError, "alternative identities"):
+            run(request([llm([1], kv_prefix=prefix, input_token_ids=[1, 2, 3, 4])]))
+        for invalid in ({"prompt": -1, "completion": 1}, {"prompt": 9},
+                        {"prompt": 9, "completion": 2**32}):
+            with self.assertRaises(ValueError):
+                run(request([llm([1], provider_tokens=invalid)]))
+
     def test_rejects_incomplete_or_invalid_timings(self):
         for node in [
             llm([1], output_tokens=2),

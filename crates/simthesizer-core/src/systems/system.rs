@@ -5,6 +5,19 @@ use crate::module::{LogicalHandler, Module};
 use crate::types::{InstanceLoad, NodeID, Request, RequestResult, SubRequest};
 
 pub enum SystemEvent {
+    KvPreempted {
+        request_id: u64,
+    },
+    KvProgress {
+        request_id: u64,
+        computed_tokens: u32,
+    },
+    KvCapacity {
+        request_id: u64,
+        ranks: Vec<usize>,
+        required_bytes: u64,
+        continuation: NodeID,
+    },
     RequestCompleted {
         request: Request,
         result: RequestResult,
@@ -12,6 +25,59 @@ pub enum SystemEvent {
 }
 
 pub trait System: Module + LogicalHandler {
+    fn next_kv_capacity_event(&self, _rank: usize) -> Option<NodeID> {
+        None
+    }
+
+    fn external_kv_budget(&self, _rank: usize) -> Result<u64> {
+        anyhow::bail!("system does not expose external KV capacity")
+    }
+    fn adopt_external_state(&mut self, _request_id: u64) -> Result<()> {
+        Ok(())
+    }
+    fn set_external_admission_blocked(&mut self, _request_id: u64, _blocked: bool) -> Result<()> {
+        Ok(())
+    }
+    fn set_external_kv_reclaimable_bytes(&mut self, _bytes: &[u64]) -> Result<()> {
+        Ok(())
+    }
+    fn set_external_blocked(&mut self, _request_id: u64, _blocked: bool) -> Result<()> {
+        Ok(())
+    }
+    fn external_kv_requirement(&self, _ranks: &[usize]) -> Option<(u64, u64)> {
+        None
+    }
+    fn restore_external_prefix(&mut self, _request_id: u64, _tokens: u32) -> Result<()> {
+        anyhow::bail!("system does not support external KV restore")
+    }
+    fn adopt_external_prefix(&mut self, _request_id: u64, _tokens: u32) -> Result<()> {
+        anyhow::bail!("system does not support external KV adoption")
+    }
+    fn configure_external_kv_ranks(&mut self) -> Result<Vec<crate::scheduler::KvMemoryInfo>> {
+        Ok(vec![self.configure_external_kv()?])
+    }
+
+    fn set_external_kv_rank_bytes(&mut self, bytes: &[u64]) -> Result<()> {
+        anyhow::ensure!(bytes.len() == 1, "system requires one external KV rank");
+        self.set_external_kv_bytes(bytes[0])
+    }
+
+    fn reserve_external_kv_request(&mut self, _request: &Request) -> Result<Vec<usize>> {
+        Ok(vec![0])
+    }
+
+    fn configure_external_kv(&mut self) -> Result<crate::scheduler::KvMemoryInfo> {
+        anyhow::bail!("system does not support externally owned KV")
+    }
+
+    fn set_external_kv_bytes(&mut self, _bytes: u64) -> Result<()> {
+        anyhow::bail!("system does not support externally owned KV")
+    }
+
+    fn reserve_external_prefix(&mut self, _request_id: u64, _tokens: u32) -> Result<()> {
+        anyhow::bail!("system does not support externally owned KV")
+    }
+
     fn init(&mut self) -> Result<()>;
 
     /// Scheduler work plus assigned initial LLM calls awaiting enqueue.

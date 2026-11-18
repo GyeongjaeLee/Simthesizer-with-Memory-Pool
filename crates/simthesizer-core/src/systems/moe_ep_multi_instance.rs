@@ -20,6 +20,8 @@ use crate::types::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MoeEpMultiInstanceSystem {
+    #[serde(skip)]
+    kv_capacity_event: Option<NodeID>,
     model_runner: Box<dyn ModelRunner>,
     model: Box<dyn Model>,
     schedulers: Vec<Box<dyn Scheduler>>,
@@ -43,6 +45,9 @@ pub struct MoeEpMultiInstanceSystem {
 
     #[serde(skip_deserializing, default)]
     wave_running: bool,
+
+    #[serde(skip_deserializing, default)]
+    external_kv_reservations: HashMap<u64, (usize, InstanceLoad)>,
 }
 
 struct ActiveRequest {
@@ -91,6 +96,8 @@ enum LogicalPayload {
         subrequest_index: usize,
         completion_node_id: NodeID,
     },
+    LlmCapacityReady,
+    LlmPrepareSchedule,
     LlmSchedule,
     LlmBatchComplete,
     ToolCallRun {
@@ -108,6 +115,9 @@ fn parse_payload(payload: Box<dyn Any>) -> Result<LogicalPayload> {
 impl MoeEpMultiInstanceSystem {
     fn rank_loads(&self) -> Vec<InstanceLoad> {
         let mut loads: Vec<_> = self.schedulers.iter().map(|s| s.instance_load()).collect();
+        for (rank, load) in self.external_kv_reservations.values() {
+            loads[*rank] = [loads[*rank], *load].into_iter().sum();
+        }
         for active in self.active_requests.values() {
             let index = active.instance_index;
             loads[index] = [
@@ -205,6 +215,9 @@ impl MoeEpMultiInstanceSystem {
                         token_latency: completion.token_latency.clone(),
                         interval: *interval,
                         model: model.clone(),
+                        session_id: sub_request.session_id().map(str::to_owned),
+                        provider_tokens: sub_request.provider_tokens().cloned(),
+                        kv_prefix: sub_request.kv_prefix().cloned(),
                     },
                     SubRequest::ToolCall {
                         input_tokens,
@@ -212,12 +225,14 @@ impl MoeEpMultiInstanceSystem {
                         next,
                         duration,
                         interval,
+                        session_id,
                     } => ResultSubRequest::ToolCall {
                         input_tokens: *input_tokens,
                         output_tokens: *output_tokens,
                         next: next.clone(),
                         duration: duration.unwrap_or(0.0),
                         interval: *interval,
+                        session_id: session_id.clone(),
                     },
                 })
             })
@@ -253,8 +268,13 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 let pending = self.pending_requests.remove(&request_id).ok_or_else(|| {
                     anyhow!("moe_ep_multi_instance is missing request {request_id} during arrival")
                 })?;
-                let loads = self.rank_loads();
-                let instance_index = self.router.select_instance(&pending, &loads)?;
+                let instance_index =
+                    if let Some((rank, _)) = self.external_kv_reservations.remove(&request_id) {
+                        rank
+                    } else {
+                        let loads = self.rank_loads();
+                        self.router.select_instance(&pending, &loads)?
+                    };
                 if instance_index >= self.schedulers.len() {
                     bail!("router selected invalid instance index {instance_index}");
                 }
@@ -361,6 +381,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     output_token_ids,
                     known_tokens,
                     kv_tokens,
+                    kv_prefix,
                 ) = {
                     let active = self
                         .active_requests
@@ -393,6 +414,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                         output_token_ids.clone(),
                         known_tokens,
                         kv_tokens,
+                        sub_request.kv_prefix().cloned(),
                     )
                 };
                 self.schedulers[instance_index].enqueue_sub_request(ReadySubRequest {
@@ -406,9 +428,46 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     kv_tokens,
                     input_token_ids,
                     output_token_ids,
+                    kv_prefix,
                 });
-                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
                 graph.add_edge(current, schedule)?;
+                Ok(0.0)
+            }
+            LogicalPayload::LlmCapacityReady => {
+                if self.kv_capacity_event == Some(current) {
+                    self.kv_capacity_event = None;
+                }
+                Ok(0.0)
+            }
+            LogicalPayload::LlmPrepareSchedule => {
+                if let Some(capacity) = self.kv_capacity_event {
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(current, retry)?;
+                    graph.add_edge(capacity, retry)?;
+                    return Ok(0.0);
+                }
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
+                let mut previous = current;
+                for (rank, scheduler) in self.schedulers.iter().enumerate() {
+                    if let Some((request_id, required_bytes)) = scheduler.external_kv_requirement()
+                    {
+                        if let Some(&sink) = self.request_sinks.get(&request_id) {
+                            let event = graph.add_logical_node(
+                                sink,
+                                SystemEvent::KvCapacity {
+                                    request_id,
+                                    ranks: vec![rank],
+                                    required_bytes,
+                                    continuation: schedule,
+                                },
+                            );
+                            graph.add_edge(previous, event)?;
+                            previous = event;
+                        }
+                    }
+                }
+                graph.add_edge(previous, schedule)?;
                 Ok(0.0)
             }
             LogicalPayload::LlmSchedule => {
@@ -423,6 +482,30 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     has_work |= !batch.is_empty();
                     instance_batches.push(batch);
                 }
+                let preemptions: Vec<_> = self
+                    .schedulers
+                    .iter_mut()
+                    .flat_map(|s| s.take_external_preemptions())
+                    .collect();
+                if !preemptions.is_empty()
+                    || self.schedulers.iter().any(|s| s.external_reclaim_pending())
+                {
+                    for scheduler in &mut self.schedulers {
+                        scheduler.cancel_iteration();
+                    }
+                    let mut previous = current;
+                    for request_id in preemptions {
+                        if let Some(&sink) = self.request_sinks.get(&request_id) {
+                            let event = graph
+                                .add_logical_node(sink, SystemEvent::KvPreempted { request_id });
+                            graph.add_edge(previous, event)?;
+                            previous = event;
+                        }
+                    }
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(previous, retry)?;
+                    return Ok(0.0);
+                }
                 if !has_work {
                     return Ok(0.0);
                 }
@@ -436,6 +519,9 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 )?;
                 let complete = graph.add_logical_node(module, LogicalPayload::LlmBatchComplete);
                 graph.add_edge(last_node, complete)?;
+                let capacity = graph.add_logical_node(module, LogicalPayload::LlmCapacityReady);
+                graph.add_edge(complete, capacity)?;
+                self.kv_capacity_event = Some(capacity);
                 Ok(0.0)
             }
             LogicalPayload::LlmBatchComplete => {
@@ -444,14 +530,34 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 for scheduler in &mut self.schedulers {
                     completions.extend(scheduler.done_iteration(now));
                 }
+                let mut previous = current;
+                for scheduler in &mut self.schedulers {
+                    for (request_id, computed_tokens) in scheduler.take_kv_progress() {
+                        if let Some(&sink) = self.request_sinks.get(&request_id) {
+                            let event = graph.add_logical_node(
+                                sink,
+                                SystemEvent::KvProgress {
+                                    request_id,
+                                    computed_tokens,
+                                },
+                            );
+                            graph.add_edge(previous, event)?;
+                            previous = event;
+                        }
+                    }
+                }
                 for completion in completions {
                     let completion_node_id = completion.completion_node_id;
                     self.queue_completion(completion_node_id, completion)?;
-                    graph.add_edge(current, completion_node_id)?;
+                    graph.add_edge(previous, completion_node_id)?;
                 }
 
-                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
-                graph.add_edge(current, schedule)?;
+                let capacity = self.kv_capacity_event.expect("active batch capacity fence");
+                if previous != current {
+                    graph.add_edge(previous, capacity)?;
+                }
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                graph.add_edge(capacity, schedule)?;
                 Ok(0.0)
             }
             LogicalPayload::ToolCallRun { duration } => Ok(duration),
@@ -462,6 +568,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
 impl Module for MoeEpMultiInstanceSystem {
     fn observe(&self) -> serde_json::Value {
         serde_json::json!({
+            "iteration_active": self.wave_running,
             "schedulers": self.schedulers.iter().map(|s| s.observe()).collect::<Vec<_>>()
         })
     }
@@ -478,13 +585,129 @@ impl Module for MoeEpMultiInstanceSystem {
 }
 
 impl System for MoeEpMultiInstanceSystem {
+    fn next_kv_capacity_event(&self, rank: usize) -> Option<NodeID> {
+        (rank < self.schedulers.len())
+            .then_some(self.kv_capacity_event)
+            .flatten()
+    }
+    fn external_kv_budget(&self, rank: usize) -> Result<u64> {
+        self.schedulers
+            .get(rank)
+            .ok_or_else(|| anyhow!("invalid external KV rank"))?
+            .external_kv_budget()
+    }
+    fn adopt_external_state(&mut self, request_id: u64) -> Result<()> {
+        for scheduler in &mut self.schedulers {
+            scheduler.adopt_external_state(request_id);
+        }
+        Ok(())
+    }
+    fn set_external_admission_blocked(&mut self, request_id: u64, blocked: bool) -> Result<()> {
+        for scheduler in &mut self.schedulers {
+            scheduler.set_external_admission_blocked(request_id, blocked);
+        }
+        Ok(())
+    }
+    fn set_external_kv_reclaimable_bytes(&mut self, bytes: &[u64]) -> Result<()> {
+        anyhow::ensure!(
+            bytes.len() == self.schedulers.len(),
+            "external KV requires every EP rank"
+        );
+        for (scheduler, &bytes) in self.schedulers.iter_mut().zip(bytes) {
+            scheduler.set_external_kv_reclaimable_bytes(bytes);
+        }
+        Ok(())
+    }
+    fn set_external_blocked(&mut self, request_id: u64, blocked: bool) -> Result<()> {
+        for scheduler in &mut self.schedulers {
+            scheduler.set_external_blocked(request_id, blocked);
+        }
+        Ok(())
+    }
+    fn external_kv_requirement(&self, ranks: &[usize]) -> Option<(u64, u64)> {
+        self.schedulers
+            .get(*ranks.first()?)?
+            .external_kv_requirement()
+    }
+    fn restore_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        for scheduler in &mut self.schedulers {
+            scheduler.restore_external_prefix(request_id, tokens)?;
+        }
+        Ok(())
+    }
+
+    fn adopt_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        // Completion may already have removed the scheduler entry; adoption is then a no-op.
+        for scheduler in &mut self.schedulers {
+            scheduler.adopt_external_prefix(request_id, tokens)?;
+        }
+        Ok(())
+    }
+
+    fn configure_external_kv_ranks(&mut self) -> Result<Vec<crate::scheduler::KvMemoryInfo>> {
+        let parallel = self.model_runner.parallel_strategy();
+        anyhow::ensure!(
+            parallel.tp == 1 && parallel.pp == 1,
+            "external EP KV requires TP=PP=1"
+        );
+        let compatibility = self.model.kv_compatibility();
+        self.schedulers
+            .iter_mut()
+            .map(|scheduler| {
+                let mut memory = scheduler.configure_external_kv()?;
+                memory.compatibility = compatibility;
+                Ok(memory)
+            })
+            .collect()
+    }
+
+    fn set_external_kv_rank_bytes(&mut self, bytes: &[u64]) -> Result<()> {
+        anyhow::ensure!(
+            bytes.len() == self.schedulers.len(),
+            "external KV reservation must name every EP rank"
+        );
+        for (scheduler, bytes) in self.schedulers.iter_mut().zip(bytes) {
+            scheduler.set_external_kv_bytes(*bytes)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_external_kv_request(&mut self, request: &Request) -> Result<Vec<usize>> {
+        request.validate()?;
+        let id = request.request_id;
+        anyhow::ensure!(
+            !self.external_kv_reservations.contains_key(&id)
+                && !self.pending_requests.contains_key(&id)
+                && !self.active_requests.contains_key(&id),
+            "duplicate external KV request {id}"
+        );
+        let rank = self.router.select_instance(request, &self.rank_loads())?;
+        anyhow::ensure!(
+            rank < self.schedulers.len(),
+            "router selected invalid rank {rank}"
+        );
+        let load = pending_llm_load(request, request.initial.iter().copied());
+        self.external_kv_reservations.insert(id, (rank, load));
+        Ok(vec![rank])
+    }
+
+    fn reserve_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
+        let rank = self
+            .external_kv_reservations
+            .get(&request_id)
+            .map(|(rank, _)| *rank)
+            .ok_or_else(|| anyhow!("external KV request {request_id} has no reserved rank"))?;
+        self.schedulers[rank].reserve_external_prefix(request_id, tokens)
+    }
+
     fn instance_load(&self) -> InstanceLoad {
         self.rank_loads()
             .into_iter()
             .chain(
                 self.pending_requests
-                    .values()
-                    .map(|request| pending_llm_load(request, request.initial.iter().copied())),
+                    .iter()
+                    .filter(|(id, _)| !self.external_kv_reservations.contains_key(id))
+                    .map(|(_, request)| pending_llm_load(request, request.initial.iter().copied())),
             )
             .sum()
     }
@@ -602,6 +825,12 @@ impl System for MoeEpMultiInstanceSystem {
     }
 
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
+        if !self.external_kv_reservations.is_empty() {
+            bail!(
+                "moe_ep_multi_instance finished with {} external KV requests still reserved",
+                self.external_kv_reservations.len()
+            );
+        }
         if !self.pending_requests.is_empty() {
             bail!(
                 "moe_ep_multi_instance finished with {} requests still awaiting arrival",

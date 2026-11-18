@@ -31,12 +31,22 @@ successful simulation and flush; existing trace files are never replaced.
 | `running_requests` | Admitted, unfinished LLM sub-requests, including those retaining state outside the current batch |
 | `waiting_requests` | Enqueued sub-requests without admission, including preempted requests |
 | `generation_tokens_total` | Committed token emissions since scheduler creation |
+| `hbm_allocated_bytes` | Physical HBM occupancy, including weights, private allocation, cached blocks and externally owned reservations |
+| `prefix_cache_bytes` | Resident attention KV and recurrent checkpoints, including request-local opaque cache |
+| `preemptions_total` | Running requests returned to waiting after allocation failure |
+| `hbm_admission_waiting_requests` | Calls waiting for HBM capacity, including the FCFS suffix blocked behind them |
+| `kv_preparation_waiting_requests` | Enqueued calls blocked on external KV preparation |
+| `scheduler_waiting_requests` | Other enqueued calls outside the current batch |
+| `iteration_active` | A serving iteration is executing |
 
 An admission set keyed by completion node owns membership; its size gives the
 running count. Waiting is queue length minus that size. Admission, preemption,
 and completion update the set. Token generation increments at the emission
 site, including the final prefill chunk. Cached input and scheduled work do not
 increment it. Routing load snapshots retain their existing batch-based meaning.
+
+Wait gauges partition enqueued calls: external KV preparation takes precedence
+over admission and scheduler waiting.
 
 ## Composition and comparison
 
