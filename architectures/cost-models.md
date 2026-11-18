@@ -74,13 +74,18 @@ collectives, but not idle time or KV transfers.
   lowest latency, then the fewest hops, and are cached until the topology
   changes.
 - A flow transmits at its rate, then waits its route's total latency.
-- Each link divides its bandwidth equally among its active flows, and a flow
-  runs at its tightest link's share. Bandwidth a flow cannot use is not
-  redistributed.
+- Rates are weighted max-min fair, as under work-conserving link arbitration:
+  links saturate in order of their per-weight share, fixing their flows, and
+  capacity a flow cannot use because of another bottleneck goes to the rest.
 - The simulator keeps its own clock, advanced on every poll, and answers each
   pending poll with the delay to its next flow event. This revisits rates when
   another flow releases bandwidth.
 - Every owner has its own instance, so flows of different owners never contend.
+
+The opt-in CXL topology compiles physical ports and directional service edges
+into one shared flow instance, so all traffic routed over it contends. Explicit
+route waypoints keep traffic on its configured fabric; equal-hop path striping
+uses parallel links. See [CXL topology](cxl-topology.md).
 
 ## Evolution Rules
 

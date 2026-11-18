@@ -71,6 +71,20 @@ fn a_short_flow_releases_bandwidth_without_delaying_the_long_flows_completion() 
 }
 
 #[test]
+fn capacity_a_bottlenecked_flow_cannot_use_goes_to_the_others() {
+    // 0 -> 2 is capped at 10 before the shared 2 -> 3 link (64). Max-min gives
+    // 10 and 54, so both payloads finish together at 1 s; an equal split would
+    // hold the second flow at 32 until the first ends (1.34375 s).
+    let mut net = network(
+        4,
+        &[(0, 2, 10.0, 0.0), (1, 2, 1000.0, 0.0), (2, 3, 64.0, 0.0)],
+    );
+    let done = finish(&mut net, &[(0, 3, 10, 0.0), (1, 3, 54, 0.0)]).unwrap();
+    close(done[0], 1.0);
+    close(done[1], 1.0);
+}
+
+#[test]
 fn staggered_arrivals_change_rates_only_after_arrival() {
     let mut net = network(2, &[(0, 1, 10.0, 0.0)]);
     let done = finish(&mut net, &[(0, 1, 10, 0.0), (0, 1, 20, 0.5)]).unwrap();

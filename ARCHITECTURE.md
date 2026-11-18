@@ -97,6 +97,7 @@ Detailed contracts:
 - [Validation](architectures/validation.md)
 - [Observability](architectures/observability.md)
 - [Agent workflow](architectures/agent-workflow.md)
+- [CXL physical topology](architectures/cxl-topology.md)
 
 ## Simulation Flow
 
