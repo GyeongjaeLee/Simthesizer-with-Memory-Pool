@@ -98,6 +98,16 @@ fn costs_above_the_measured_range_extrapolate_without_decreasing() {
 }
 
 #[test]
+fn projected_speedup_divides_measured_latency() {
+    let mut config = system(1);
+    config["model_runner"]["compute_speedup"] = json!(2.0);
+    let (results, _) = run_system(config, &[llm(0, 0.0, 4, 2)]).unwrap();
+    let l = latencies(&results, 0);
+    close(l[0], 5e-3);
+    close(l[1], 0.52e-3);
+}
+
+#[test]
 fn table_parallelism_must_match_the_runner() {
     let mut system: Box<dyn System> = serde_json::from_value(system(4)).unwrap();
     let error = system.init().unwrap_err().to_string();

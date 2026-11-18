@@ -64,7 +64,9 @@ same coordinates. One axis carries token-wise work and the other causal
 attention, so unequal lengths, more requests than measured and decode tokens in
 mixed batches need no separate rule. Lookups interpolate linearly, clamp below
 and extrapolate above without decreasing cost; extrapolated and mixed lookups are
-counted. Tables measured by a serving engine include its graphs, fusion and
+counted. `compute_speedup` divides every lookup for a declared projection to an
+unmeasured platform; it is a hypothesis, never fitted to serving results, and is
+reported in observations. Tables measured by a serving engine include its graphs, fusion and
 collectives, but not idle time or KV transfers.
 
 ## Flow Network

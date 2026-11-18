@@ -13,6 +13,15 @@ Computed blocks without supplied identity receive request-local keys, created at
 compute completion. Every reuse starts at the longest available continuous prefix;
 missing suffixes are prefetched or recomputed. The final sampled token has no KV.
 
+Released calls without an explicit binding choose a worker by `routing`.
+`vllm_dp` (default) follows vLLM's data-parallel load balancer (`DPLBAsyncMPClient`,
+commit `ce72586f`): a 100 ms snapshot of waiting (queued or preparing KV) and
+running calls plus KV usage, where unreferenced cached blocks count as free;
+score `max(in-flight, waiting + running)`, plus `6 · waiting · max(0, usage − 0.5)`;
+a rotating scan start; and a local waiting increment per choice. `session_hash`
+pins each session to a stable hash, as in vLLM production-stack session routing,
+and falls back to `vllm_dp` without a session.
+
 Explicit `calls` bindings remain diagnostic fixtures. `blocks` specifies a full
 ordered prefix, `completed_blocks` supplies computed identities, and
 `seed_host_blocks` declares initial host copies without an invented transfer.

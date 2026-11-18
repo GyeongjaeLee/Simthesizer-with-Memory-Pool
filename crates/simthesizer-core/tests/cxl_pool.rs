@@ -645,13 +645,44 @@ fn ep_rank_copy_preserves_live_source_on_the_same_worker() {
             && b["pins"].as_array().unwrap().is_empty()));
 }
 
+/// One worker: lifecycle checks without call routing.
 fn native_config(block_tokens: u32, host_bytes: u64) -> Value {
     let mut c = config(vec!["D0".into()], false);
+    c["instances"].as_array_mut().unwrap().truncate(1);
     c["calls"] = json!([]);
     c["block_tokens"] = json!(block_tokens);
     c["block_bytes"] = json!(u64::from(block_tokens) * 64);
     c["host_capacity_bytes"]["node0"] = json!(host_bytes);
     c
+}
+
+#[test]
+fn routing_spreads_concurrent_calls_or_pins_sessions() {
+    let tokens = |state: &Value| -> Vec<u64> {
+        state["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["scheduler"]["generation_tokens_total"].as_u64().unwrap())
+            .collect()
+    };
+    let call = |id: u64, session: &str, arrival: f64| -> Request {
+        serde_json::from_value(json!({"request_id":id,"arrival_time":arrival,"initial":[0],
+            "sub_requests":[{"kind":"llm","input_tokens":5,"output_tokens":2,"session_id":session,"next":[]}]}))
+        .unwrap()
+    };
+    let mut c = native_config(1, 4096);
+    let worker = c["instances"][0].clone();
+    c["instances"].as_array_mut().unwrap().push(worker);
+    // vLLM DP: an empty snapshot and the in-flight floor alternate a burst.
+    let (_, _, snapshots) = run(c.clone(), vec![call(0, "a", 0.0), call(1, "b", 0.0)]);
+    assert_eq!(tokens(&snapshots.last().unwrap()["state"]), [2, 2]);
+    // Session hash: every call of one session reaches the same worker.
+    c["routing"] = json!("session_hash");
+    let (_, _, snapshots) = run(c, (0..4).map(|id| call(id, "s", id as f64)).collect());
+    let mut counts = tokens(&snapshots.last().unwrap()["state"]);
+    counts.sort();
+    assert_eq!(counts, [0, 8]);
 }
 
 #[test]
@@ -981,6 +1012,8 @@ fn hybrid_prefix_requires_sparse_recurrent_checkpoint_and_releases_source_pin() 
 #[test]
 fn hybrid_attention_only_fixture_is_a_cache_miss() {
     let mut c = recurrent_config("M*-E");
+    let worker = c["instances"][0].clone();
+    c["instances"].as_array_mut().unwrap().push(worker);
     c["calls"] = json!([{"request_id":0,"subrequest_index":0,"worker":0,"seed_host_blocks":keys(2)}, {"request_id":1,"subrequest_index":0,"worker":1,"blocks":keys(2)}]);
     let (_, state, _) = run(
         c,

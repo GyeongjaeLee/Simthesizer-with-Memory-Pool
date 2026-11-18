@@ -16,6 +16,41 @@ fn one() -> usize {
     1
 }
 
+/// vLLM's DP coordinator publishes engine stats at most every 100 ms.
+const STATS_INTERVAL_S: f64 = 0.1;
+
+/// Worker choice for calls without an explicit binding.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Routing {
+    /// vLLM data-parallel load balancing (`DPLBAsyncMPClient`, commit
+    /// ce72586f8aded8dafa7d4c745a5cef3198070e3e).
+    #[default]
+    VllmDp,
+    /// Stable hash of the session ID, as in vLLM production-stack session
+    /// routing; calls without a session fall back to `vllm_dp`.
+    SessionHash,
+}
+
+/// One frontend: load is the larger of this client's in-flight calls and the
+/// snapshot's waiting + running; waiting is penalized from 50% KV usage. The
+/// scan starts at a rotating index and the first strict minimum wins.
+fn vllm_dp_choice(snapshot: &[(f64, f64, f64)], inflight: &[u64], start: usize) -> usize {
+    let mut best = (f64::INFINITY, 0);
+    for i in 0..snapshot.len() {
+        let index = (start + i) % snapshot.len();
+        let (waiting, running, kv_usage) = snapshot[index];
+        let mut score = (inflight[index] as f64).max(waiting + running);
+        if waiting > 0.0 {
+            score += waiting * 6.0 * (kv_usage - 0.5).max(0.0);
+        }
+        if score < best.0 {
+            best = (score, index);
+        }
+    }
+    best.1
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CallBinding {
@@ -69,6 +104,8 @@ pub struct CxlPoolSystem {
     #[serde(default = "one")]
     max_outstanding_reads: usize,
     #[serde(default)]
+    routing: Routing,
+    #[serde(default)]
     calls: Vec<CallBinding>,
     #[serde(skip)]
     binding_index: BTreeMap<(u64, usize), usize>,
@@ -118,6 +155,17 @@ pub struct CxlPoolSystem {
     pending_stores: BTreeMap<String, VecDeque<BlockKey>>,
     #[serde(skip)]
     queued_stores: BTreeSet<BlockKey>,
+    /// Per worker (waiting, running, KV usage) as of `lb_refreshed`.
+    #[serde(skip)]
+    lb_snapshot: Vec<(f64, f64, f64)>,
+    #[serde(skip)]
+    lb_refreshed: Option<f64>,
+    #[serde(skip)]
+    lb_start: usize,
+    #[serde(skip)]
+    routed: BTreeMap<(u64, usize), usize>,
+    #[serde(skip)]
+    inflight_calls: Vec<u64>,
 }
 
 crate::register_system!(CxlPoolSystem, "cxl_pool");
@@ -446,6 +494,69 @@ impl CxlPoolSystem {
             }
         }
         binding
+    }
+    /// vLLM counts queued, preparing and resumed requests as waiting and
+    /// admitted ones as running.
+    fn load_snapshot(&self, worker: usize) -> Result<(f64, f64, f64)> {
+        let state = self.instances[worker].observe();
+        let (waiting, running) = match (
+            state["scheduler"]["waiting_requests"].as_u64(),
+            state["scheduler"]["running_requests"].as_u64(),
+        ) {
+            (Some(waiting), Some(running)) => (waiting, running),
+            _ => {
+                let load = self.instances[worker].instance_load();
+                (load.waiting_requests as u64, load.running_requests as u64)
+            }
+        };
+        let preparing = self
+            .active_calls()
+            .filter(|call| call.binding.worker == worker && call.ready.is_none())
+            .count() as u64;
+        // vLLM usage counts referenced blocks; unreferenced cached blocks are free.
+        let mut kv_usage: f64 = 0.0;
+        for (rank, memory) in self.memory[worker].iter().enumerate() {
+            if memory.capacity_bytes == 0 {
+                continue;
+            }
+            let private = memory
+                .capacity_bytes
+                .saturating_sub(self.instances[worker].external_kv_budget(rank)?);
+            let store = &self.stores[&StoreId::Hbm(worker, rank)];
+            let pinned = store.used.saturating_sub(store.reclaimable_bytes);
+            kv_usage = kv_usage.max((private + pinned) as f64 / memory.capacity_bytes as f64);
+        }
+        Ok(((waiting + preparing) as f64, running as f64, kv_usage))
+    }
+    fn route(&mut self, request: u64, index: usize, now: f64) -> Result<usize> {
+        let workers = self.instances.len();
+        let session = self.active[&request].request.sub_requests[index].session_id();
+        let worker = match (self.routing, session) {
+            (Routing::SessionHash, Some(session)) => {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                session.hash(&mut hash);
+                (hash.finish() % workers as u64) as usize
+            }
+            _ => {
+                if self
+                    .lb_refreshed
+                    .is_none_or(|time| now - time >= STATS_INTERVAL_S)
+                {
+                    self.lb_snapshot = (0..workers)
+                        .map(|worker| self.load_snapshot(worker))
+                        .collect::<Result<_>>()?;
+                    self.lb_refreshed = Some(now);
+                }
+                let worker = vllm_dp_choice(&self.lb_snapshot, &self.inflight_calls, self.lb_start);
+                self.lb_snapshot[worker].0 += 1.0;
+                self.lb_start = (self.lb_start + 1) % workers;
+                worker
+            }
+        };
+        self.inflight_calls[worker] += 1;
+        self.routed.insert((request, index), worker);
+        Ok(worker)
     }
     fn session(&self, request: u64, index: usize) -> (String, u64) {
         (
@@ -1712,6 +1823,9 @@ impl CxlPoolSystem {
             }
         }
         self.store_completed(now, current, graph)?;
+        if let Some(worker) = self.routed.remove(&(request, index)) {
+            self.inflight_calls[worker] -= 1;
+        }
         let active = self.active.get_mut(&request).unwrap();
         ensure!(!active.completed[index], "duplicate subrequest completion");
         active.completed[index] = true;
@@ -1967,7 +2081,10 @@ impl LogicalHandler for CxlPoolSystem {
                         Ok(0.0)
                     }
                     SubRequest::Llm { .. } => {
-                        let binding = self.binding(request, index);
+                        let mut binding = self.binding(request, index);
+                        if binding.automatic {
+                            binding.worker = self.route(request, index, now)?;
+                        }
                         let child = self.next_child;
                         self.next_child += 1;
                         let child_request = self.child_request(request, index, child, now);
@@ -2217,6 +2334,7 @@ impl Module for CxlPoolSystem {
 impl System for CxlPoolSystem {
     fn init(&mut self) -> Result<()> {
         ensure!(!self.instances.is_empty(), "cxl_pool needs workers");
+        self.inflight_calls = vec![0; self.instances.len()];
         ensure!(
             self.block_tokens > 0 && self.stripe_blocks > 0 && self.max_outstanding_reads > 0,
             "block size, stripe and read concurrency must be positive"
@@ -2463,6 +2581,21 @@ impl System for CxlPoolSystem {
 mod storage_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn vllm_dp_balances_bursts_and_avoids_kv_bound_queues() {
+        // Empty snapshot: the in-flight floor and rotating start spread a burst.
+        let empty = vec![(0.0, 0.0, 0.0); 2];
+        assert_eq!(vllm_dp_choice(&empty, &[0, 0], 0), 0);
+        assert_eq!(vllm_dp_choice(&empty, &[1, 0], 1), 1);
+        assert_eq!(vllm_dp_choice(&empty, &[1, 1], 0), 0);
+        // 2 + 2 + 2·6·(1.0 − 0.5) = 10 loses to 3 + 2 at 40% usage.
+        let pressured = vec![(2.0, 2.0, 1.0), (3.0, 2.0, 0.4)];
+        assert_eq!(vllm_dp_choice(&pressured, &[0, 0], 0), 1);
+        // Without waiting, KV usage does not matter.
+        let idle = vec![(0.0, 3.0, 1.0), (0.0, 4.0, 0.0)];
+        assert_eq!(vllm_dp_choice(&idle, &[0, 0], 1), 0);
+    }
 
     #[test]
     fn fragmented_storage_uses_disjoint_extents_and_coalesces_release() {

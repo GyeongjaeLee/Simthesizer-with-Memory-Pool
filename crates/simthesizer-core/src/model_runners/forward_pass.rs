@@ -20,6 +20,10 @@ use crate::types::{NodeID, ParallelStrategy, RequestState};
 pub struct ForwardPassRunner {
     tp: u32,
     table: PathBuf,
+    /// Hypothetical speedup over the measured platform, for projections to
+    /// unmeasured hardware; 1 keeps the measurement.
+    #[serde(default = "unit")]
+    compute_speedup: f64,
     #[serde(skip)]
     loaded: Option<Table>,
     #[serde(skip)]
@@ -27,6 +31,10 @@ pub struct ForwardPassRunner {
 }
 
 crate::register_model_runner!(ForwardPassRunner, "forward_pass");
+
+fn unit() -> f64 {
+    1.0
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +79,7 @@ impl Module for ForwardPassRunner {
         serde_json::json!({
             "tp": self.tp,
             "table": self.table,
+            "compute_speedup": self.compute_speedup,
             "lookups": self.lookups,
         })
     }
@@ -96,6 +105,10 @@ impl ModelRunner for ForwardPassRunner {
 
     fn init(&mut self, _: &dyn Model) -> Result<()> {
         ensure!(self.tp > 0, "forward_pass requires a positive TP size");
+        ensure!(
+            self.compute_speedup.is_finite() && self.compute_speedup > 0.0,
+            "compute_speedup must be positive"
+        );
         let file: TableFile = serde_json::from_reader(
             std::fs::File::open(&self.table)
                 .with_context(|| format!("opening {}", self.table.display()))?,
@@ -132,7 +145,7 @@ impl ModelRunner for ForwardPassRunner {
         let (latency, inside) = table.iteration(batch, &mut self.lookups)?;
         self.lookups.extrapolated += u64::from(!inside);
         let owner = self as *mut Self as *mut dyn LogicalHandler;
-        let node = graph.add_logical_node(owner, latency);
+        let node = graph.add_logical_node(owner, latency / self.compute_speedup);
         graph.add_edge(current, node)?;
         Ok(node)
     }
