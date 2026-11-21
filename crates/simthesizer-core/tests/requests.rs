@@ -96,3 +96,39 @@ fn llm_token_count_overflow_is_rejected() {
     }
     assert!(r.validate().is_err());
 }
+
+fn incremental(second: serde_json::Value) -> Request {
+    serde_json::from_value(
+        json!({"request_id":1,"arrival_time":0,"initial":[0],"sub_requests":[
+        {"kind":"llm","input_tokens":12,"output_tokens":1,"next":[1],
+         "kv_prefix":{"namespace":"n","block_tokens":4,"block_ids":[1,2,3]}},
+        {"kind":"llm","input_tokens":16,"output_tokens":1,"next":[],"kv_prefix":second}]}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn incremental_prefixes_resolve_through_earlier_calls() {
+    let r = incremental(
+        json!({"namespace":"n","block_tokens":4,"parent":0,"shared":2,"block_ids":[7,8]}),
+    );
+    r.validate().unwrap();
+    let full = r.resolved_kv_prefix(1).unwrap();
+    assert_eq!(
+        (full.block_ids, full.parent, full.shared),
+        (vec![1, 2, 7, 8], None, 0)
+    );
+    assert_eq!(r.resolved_kv_prefix(0).unwrap().block_ids, [1, 2, 3]);
+    for invalid in [
+        json!({"namespace":"n","block_tokens":4,"parent":1,"block_ids":[]}),
+        json!({"namespace":"m","block_tokens":4,"parent":0,"shared":1,"block_ids":[]}),
+        json!({"namespace":"n","block_tokens":4,"parent":0,"shared":4,"block_ids":[]}),
+        json!({"namespace":"n","block_tokens":4,"shared":1,"block_ids":[]}),
+        json!({"namespace":"n","block_tokens":4,"parent":0,"shared":3,"block_ids":[4,5]}),
+    ] {
+        assert!(
+            incremental(invalid.clone()).validate().is_err(),
+            "{invalid}"
+        );
+    }
+}

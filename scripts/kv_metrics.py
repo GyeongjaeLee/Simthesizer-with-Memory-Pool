@@ -34,7 +34,9 @@ def active(value, name):
 
 
 def snapshot(state):
-    """Extract component gauges without walking cache contents or event histories."""
+    """Extract scheduler gauges without walking cache contents or event histories.
+    Every enqueued call's wait phase belongs to its scheduler; a CXL pool enqueues
+    calls on release, so its parent state holds no waits."""
     waits = {}
     execution = {}
 
@@ -67,21 +69,6 @@ def snapshot(state):
                 raise ValueError(f"{path or '/'} needs joint iteration_active for EP")
             for index, child in enumerate(children):
                 scheduler(child, f"{path}/schedulers/{index}", covered)
-        if "cxl_pool" in value:
-            pool = value["cxl_pool"]
-            pool_path = f"{path}/cxl_pool"
-            if not isinstance(pool, dict):
-                raise ValueError(f"{pool_path} must be an object")
-            # Parent gauges contain only calls not yet enqueued in a child.
-            # Resumed calls appear in the child's KV-preparation gauge instead.
-            waits[pool_path] = {
-                metric: (
-                    0
-                    if field == "scheduler_waiting_requests"
-                    else count(pool.get(field), f"{pool_path}/{field}")
-                )
-                for field, metric in WAIT_FIELDS.items()
-            }
         for key in CHILD_ARRAYS:
             if key not in value:
                 continue

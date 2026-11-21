@@ -109,8 +109,8 @@ impl ModelRunner for ForwardPassRunner {
             self.compute_speedup.is_finite() && self.compute_speedup > 0.0,
             "compute_speedup must be positive"
         );
-        let file: TableFile = serde_json::from_reader(
-            std::fs::File::open(&self.table)
+        let file: TableFile = serde_json::from_slice(
+            &std::fs::read(&self.table)
                 .with_context(|| format!("opening {}", self.table.display()))?,
         )
         .with_context(|| format!("parsing {}", self.table.display()))?;
@@ -161,8 +161,14 @@ fn interpolate(x: f64, (x0, y0): (f64, f64), (x1, y1): (f64, f64)) -> f64 {
     }
 }
 
-/// Piecewise-linear samples, clamped below.
-struct Curve(Vec<(f64, f64)>);
+/// Piecewise-linear samples, clamped below. Above the last sample, cost grows
+/// at the least-squares slope of the samples in the upper half of the range
+/// (at least the last two), never negative: neighboring samples from different batch compositions differ by
+/// noise over tiny coordinate gaps, so their slope would dominate.
+struct Curve {
+    points: Vec<(f64, f64)>,
+    tail: f64,
+}
 
 impl Curve {
     fn new(mut points: Vec<(f64, f64)>) -> Result<Self> {
@@ -183,19 +189,39 @@ impl Curve {
                 _ => merged.push((x, y, 1.0)),
             }
         }
-        Ok(Self(
-            merged.into_iter().map(|(x, y, n)| (x, y / n)).collect(),
-        ))
+        let points: Vec<(f64, f64)> = merged.into_iter().map(|(x, y, n)| (x, y / n)).collect();
+        let last = points[points.len() - 1].0;
+        let start = points
+            .partition_point(|p| p.0 < last / 2.0)
+            .min(points.len().saturating_sub(2));
+        let upper = &points[start..];
+        let n = upper.len() as f64;
+        let (mx, my) = upper
+            .iter()
+            .fold((0.0, 0.0), |(x, y), p| (x + p.0 / n, y + p.1 / n));
+        let spread: f64 = upper.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        let tail = if spread > 0.0 {
+            upper.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / spread
+        } else {
+            0.0
+        };
+        Ok(Self {
+            points,
+            tail: tail.max(0.0),
+        })
     }
 
     fn at(&self, x: f64) -> (f64, bool) {
-        let points = &self.0;
-        let first = points[0];
+        let points = &self.points;
+        let (first, last) = (points[0], points[points.len() - 1]);
         if x <= first.0 || points.len() == 1 {
-            return (first.1, x >= first.0 && x <= points[points.len() - 1].0);
+            return (first.1, x >= first.0 && x <= last.0);
         }
-        let i = points.partition_point(|p| p.0 < x).min(points.len() - 1);
-        (interpolate(x, points[i - 1], points[i]), x <= points[i].0)
+        if x > last.0 {
+            return (last.1 + self.tail * (x - last.0), false);
+        }
+        let i = points.partition_point(|p| p.0 < x);
+        (interpolate(x, points[i - 1], points[i]), true)
     }
 }
 

@@ -186,7 +186,7 @@ impl PrefixCache {
     }
 }
 
-pub(super) fn hash_block(parent_hash: u64, first: &[u32], second: &[u32]) -> u64 {
+pub(crate) fn hash_block(parent_hash: u64, first: &[u32], second: &[u32]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     parent_hash.hash(&mut hasher);
     (first.len() + second.len()).hash(&mut hasher);

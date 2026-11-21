@@ -95,14 +95,23 @@ fn finish(net: &mut FlowNetworkSimulator, transfers: &[(u64, u64, u64)]) -> Vec<
         };
         let (src, dst, bytes) = transfers[index];
         match net
-            .simulate(src, dst, bytes, now, &mut states[index])
+            .simulate(index as u64, src, dst, bytes, now, &mut states[index])
             .unwrap()
         {
+            PollResult::Deferred => pending.push((now, index)),
             PollResult::Complete { latency } => completed[index] = now + latency,
             PollResult::Pending { latency } => {
                 assert!(latency > 0.0 && now + latency > now);
                 pending.push((now + latency, index));
             }
+        }
+        for (node, time) in net.take_wakeups() {
+            let entry = pending
+                .iter_mut()
+                .find(|entry| entry.1 == node as usize)
+                .unwrap();
+            assert!(time >= now && time < entry.0);
+            entry.0 = time;
         }
     }
     panic!("transfers did not drain")
@@ -763,4 +772,107 @@ fn adapter_bindings_accept_legacy_scalar_and_reject_invalid_selections() {
         .unwrap_err()
         .to_string()
         .contains("bypasses selected adapter"));
+}
+
+/// Sixteen switches in a ring; worker 0 and device D on S0, worker 1 on S8.
+/// Through worker 0's adapter, C2C and the NICs, D is fewer hops from worker
+/// 1's adapter than around the ring.
+fn ring_with_a_shorter_host_relay() -> Topology {
+    let mut topology = Topology {
+        endpoints: vec![endpoint("fabric".into(), EndpointKind::Fabric)],
+        links: Vec::new(),
+        workers: Vec::new(),
+        required_routes: Vec::new(),
+        routing: Routing::EqualShortest,
+    };
+    for s in 0..16 {
+        let id = format!("S{s}");
+        topology.endpoints.push(endpoint(id, EndpointKind::Switch));
+    }
+    for s in 0..16 {
+        physical(
+            &mut topology,
+            &format!("S{s}"),
+            &format!("S{}", (s + 1) % 16),
+            16,
+        );
+    }
+    let mut memory = endpoint("D".into(), EndpointKind::Memory);
+    memory.capacity_bytes = Some(1 << 30);
+    memory.read_bandwidth = Some(U);
+    memory.write_bandwidth = Some(U);
+    topology.endpoints.push(memory);
+    physical(&mut topology, "D", "S0", 8);
+    for (worker, switch) in [(0, 0), (1, 8)] {
+        let [adapter, dram, c2c, nic, gpu] =
+            ["adapter", "dram", "c2c", "nic", "gpu"].map(|kind| format!("{kind}{worker}"));
+        for (id, kind) in [
+            (&adapter, EndpointKind::Adapter),
+            (&dram, EndpointKind::Dram),
+            (&c2c, EndpointKind::Junction),
+            (&nic, EndpointKind::Nic),
+            (&gpu, EndpointKind::Gpu),
+        ] {
+            let mut node = endpoint(id.clone(), kind);
+            node.node = Some(format!("node{worker}"));
+            topology.endpoints.push(node);
+        }
+        physical(&mut topology, &adapter, &format!("S{switch}"), 16);
+        logical(&mut topology, &dram, &adapter, U);
+        logical(&mut topology, &adapter, &c2c, U);
+        for (a, b) in [(&dram, &c2c), (&dram, &nic), (&nic, &c2c), (&c2c, &gpu)] {
+            logical(&mut topology, a, b, U);
+            logical(&mut topology, b, a, U);
+        }
+        logical(&mut topology, &nic, "fabric", U);
+        logical(&mut topology, "fabric", &nic, U);
+        topology.workers.push(WorkerBinding {
+            worker,
+            rank: 0,
+            node: format!("node{worker}"),
+            adapters: vec![adapter],
+            dram,
+            nic,
+            gpu,
+        });
+    }
+    topology
+}
+
+#[test]
+fn cxl_transfers_stay_on_the_switch_fabric_when_a_host_relay_is_shorter() {
+    let mut net = ring_with_a_shorter_host_relay().build().unwrap();
+    let routes = [
+        (
+            net.transfer_route("D", "gpu1", None, Some((1, 0)), 0)
+                .unwrap(),
+            ["D:read", "adapter1-c2c1:ab", "c2c1-gpu1:ab"].as_slice(),
+        ),
+        (
+            net.transfer_route("dram1", "D", Some((1, 0)), None, 0)
+                .unwrap(),
+            ["dram1-adapter1:ab", "D:write"].as_slice(),
+        ),
+    ];
+    let links = net.observe()["flow"]["links"].clone();
+    for ((src, dst), host) in routes {
+        let paths = net.flow.route_info(src, dst).unwrap();
+        // Both directions around the ring tie.
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            let (physical, other): (Vec<_>, Vec<_>) = path
+                .links
+                .iter()
+                .map(|&index| links[index]["name"].as_str().unwrap())
+                .partition(|name| name.starts_with('L'));
+            // D's port, eight ring hops and worker 1's adapter port.
+            assert_eq!(physical.len(), 10);
+            assert_eq!(other, host);
+        }
+    }
+    // Without a CXL path, the host relay does not stand in for one.
+    let mut cut = ring_with_a_shorter_host_relay();
+    cut.links.retain(|link| link.id != "L3" && link.id != "L11");
+    let error = cut.build().err().unwrap();
+    assert!(format!("{error:#}").contains("no directed CXL fabric route"));
 }

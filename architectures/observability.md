@@ -45,11 +45,14 @@ and completion update the set. Token generation increments at the emission
 site, including the final prefill chunk. Cached input and scheduled work do not
 increment it. Routing load snapshots retain their existing batch-based meaning.
 
-Wait gauges partition enqueued calls: external KV preparation takes precedence
-over admission and scheduler waiting. CXL parent admission and preparation
-gauges count only calls not yet enqueued in a child. Resumed calls appear in
-the child preparation gauge. Durations on individual CXL events can span
-multiple phases; use the gauges for disjoint totals.
+Wait gauges partition enqueued calls: an external HBM wait takes precedence
+over external KV preparation, which takes precedence over admission behind it
+and scheduler waiting. A call awaiting its KV lookup turn is a scheduler wait.
+CXL calls enqueue on release, so worker schedulers own all their wait phases and
+the parent exports none. Their preparation equals `ttft_parts.kv_load`; admission
+also counts calls queued behind an HBM wait, which `ttft_parts` counts as queue.
+Durations on individual CXL events can span multiple phases; use the gauges for
+disjoint totals.
 
 `python scripts/kv_metrics.py TRACE.jsonl --output METRICS.json` integrates
 snapshots until the final trace timestamp. Wait totals are request-seconds;

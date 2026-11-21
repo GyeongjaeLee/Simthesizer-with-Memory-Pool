@@ -8,6 +8,14 @@ use simthesizer_core::{Engine, Graph, Model, System};
 /// Decode (requests, Σ kv) and balanced prefill (requests, Σ q, Σ kv) in ms,
 /// so prefill attention work Σ q(q/2 + kv) is 8, 40, 32 and 96.
 fn table(tp: u32, ep: u32) -> std::path::PathBuf {
+    table_with(
+        tp,
+        ep,
+        json!([[1, 0, 1.0], [1, 100, 2.0], [4, 0, 2.0], [4, 400, 4.0]]),
+    )
+}
+
+fn table_with(tp: u32, ep: u32, decode: Value) -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
         "forward-pass-{}-{}.json",
@@ -18,7 +26,7 @@ fn table(tp: u32, ep: u32) -> std::path::PathBuf {
         "format_version": 1, "latency_unit": "ms",
         "deployment": {"tp": tp, "ep": ep, "system": "test"},
         "source": {"url": "test"},
-        "decode": [[1, 0, 1.0], [1, 100, 2.0], [4, 0, 2.0], [4, 400, 4.0]],
+        "decode": decode,
         "prefill": [[1, 4, 0, 10.0], [1, 4, 8, 14.0], [1, 8, 0, 20.0], [1, 8, 8, 28.0]],
     });
     std::fs::write(&path, table.to_string()).unwrap();
@@ -95,6 +103,30 @@ fn costs_above_the_measured_range_extrapolate_without_decreasing() {
     assert!(l.windows(2).skip(1).all(|w| w[1] >= w[0]));
     assert_eq!(lookups["decode"], 149);
     assert_eq!(lookups["extrapolated"], 149 - 93);
+}
+
+#[test]
+fn extrapolation_follows_the_upper_half_trend_not_the_last_gap() {
+    // The last two samples jump over one Σ kv unit; their slope would add
+    // 0.4 ms per token.
+    let mut config = system(1);
+    config["model_runner"]["table"] = json!(table_with(
+        4,
+        1,
+        json!([
+            [1, 0, 1.0],
+            [1, 60, 1.6],
+            [1, 80, 1.8],
+            [1, 100, 2.0],
+            [1, 101, 2.4]
+        ])
+    ));
+    let (results, _) = run_system(config, &[llm(0, 0.0, 8, 150)]).unwrap();
+    // Least-squares slope over Σ kv ≥ 50.5: Σ dx·dy / Σ dx² = 17.45 / 1130.75.
+    close(
+        latencies(&results, 0)[149],
+        (2.4 + 55.0 * 17.45 / 1130.75) * 1e-3,
+    );
 }
 
 #[test]

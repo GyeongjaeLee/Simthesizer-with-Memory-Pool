@@ -28,8 +28,17 @@ pub struct ChunkedPrefillScheduler {
     num_lookahead_tokens: u32,
     #[serde(default = "default_true")]
     scheduler_reserve_full_isl: bool,
+    /// vLLM `max_num_inflight_kv_loads`: at most this many requests hold KV
+    /// for an external load before they run, and loads may start without a
+    /// free running slot or token budget. None: no cap; loads start only
+    /// while both remain.
+    #[serde(default)]
+    max_num_inflight_kv_loads: Option<usize>,
     #[serde(skip)]
     preemptions_total: u64,
+    /// Start of the iteration in flight.
+    #[serde(skip)]
+    iteration_start: f64,
     #[serde(skip)]
     progress: Vec<(u64, u32)>,
     #[serde(skip)]
@@ -40,6 +49,8 @@ pub struct ChunkedPrefillScheduler {
     external_blocked: HashSet<u64>,
     #[serde(skip)]
     external_admission: HashSet<u64>,
+    #[serde(skip)]
+    external_pending: HashSet<u64>,
     #[serde(skip)]
     next_cache_nonce: u64,
     #[serde(skip)]
@@ -53,6 +64,10 @@ pub struct ChunkedPrefillScheduler {
     external_kv_reclaimable_bytes: u64,
     #[serde(skip)]
     external_prefixes: HashMap<u64, u32>,
+    /// Admission bytes held for requests whose external prefix is loading or
+    /// loaded but which are not yet admitted.
+    #[serde(skip)]
+    external_admissions: HashMap<u64, u64>,
 
     #[serde(skip_deserializing, default)]
     queue: LinkedList<RunningRequest>,
@@ -99,17 +114,21 @@ crate::register_scheduler!(ChunkedPrefillScheduler, "chunked_prefill");
 
 impl Module for ChunkedPrefillScheduler {
     fn observe(&self) -> serde_json::Value {
+        // An external HBM wait outranks the KV lookup it holds its turn for.
         let waiting = self.queue.iter().skip(self.current_batch.len());
-        let kv_waiting = waiting
-            .clone()
-            .filter(|r| self.external_blocked.contains(&r.request_id))
-            .count();
         let admission = waiting
             .clone()
             .filter(|r| {
-                !self.external_blocked.contains(&r.request_id)
-                    && (self.admission_waiting.contains(&r.completion_node_id)
-                        || self.external_admission.contains(&r.request_id))
+                self.external_admission.contains(&r.request_id)
+                    || !self.external_blocked.contains(&r.request_id)
+                        && self.admission_waiting.contains(&r.completion_node_id)
+            })
+            .count();
+        let kv_waiting = waiting
+            .clone()
+            .filter(|r| {
+                self.external_blocked.contains(&r.request_id)
+                    && !self.external_admission.contains(&r.request_id)
             })
             .count();
 
@@ -143,6 +162,7 @@ struct RunningRequest {
     external_kv_tokens: u32,
     last_time: f64,
     token_latency: Vec<f64>,
+    first_scheduled: Option<f64>,
 
     input_token_ids: Option<Vec<u32>>,
     output_token_ids: Option<Vec<u32>>,
@@ -171,6 +191,7 @@ impl RunningRequest {
             external_kv_tokens: 0,
             last_time: request.arrival_time,
             token_latency: Vec::new(),
+            first_scheduled: None,
             input_token_ids: request.input_token_ids,
             output_token_ids: request.output_token_ids,
             block_hashes: Vec::new(),
@@ -186,6 +207,19 @@ impl RunningRequest {
 
     fn effective_kv_tokens(&self) -> u32 {
         self.shared_kv_tokens + self.private_kv_tokens
+    }
+
+    /// Tokens one step computes within a positive `budget`, ending at the
+    /// replay checkpoint.
+    fn next_chunk(&self, budget: u32, block_size: u32) -> u32 {
+        let computed = self.effective_kv_tokens();
+        let q_len = self.known_tokens.saturating_sub(computed).clamp(1, budget);
+        let checkpoint = self.replay_checkpoint(block_size);
+        if self.align_state && computed < checkpoint && computed + q_len > checkpoint {
+            checkpoint - computed
+        } else {
+            q_len
+        }
     }
 
     fn private_kv_bytes(
@@ -381,6 +415,20 @@ impl ChunkedPrefillScheduler {
     fn cache_block_bytes(&self) -> u64 {
         u64::from(self.block_size) * self.kv_bytes_per_token_per_device
     }
+
+    /// Waiting request whose external prefix is loading or loaded.
+    fn holds_external_kv(&self, request: &RunningRequest) -> bool {
+        self.external_admissions.contains_key(&request.request_id)
+    }
+
+    /// A running request waits for HBM; V1 likewise admits no waiting
+    /// request after a preemption.
+    fn running_wait(&self) -> bool {
+        self.queue.iter().any(|r| {
+            self.external_admission.contains(&r.request_id)
+                && self.admitted.contains(&r.completion_node_id)
+        })
+    }
 }
 
 impl Scheduler for ChunkedPrefillScheduler {
@@ -393,11 +441,97 @@ impl Scheduler for ChunkedPrefillScheduler {
             .queue
             .iter()
             .map(|request| self.private_bytes(request))
-            .sum();
+            .sum::<u64>()
+            + self.external_admissions.values().sum::<u64>();
         Ok(self
             .usable_device_mem
             .saturating_sub(self.model_weight_bytes_per_device)
             .saturating_sub(private))
+    }
+    fn known_tokens(&self, request_id: u64) -> Option<u32> {
+        self.queue
+            .iter()
+            .find(|r| r.request_id == request_id)
+            .map(|r| r.known_tokens)
+    }
+    fn external_admission_bytes(&self, known_tokens: u32, restored_tokens: u32) -> u64 {
+        // The admission check of `schedule` for a waiting request whose
+        // private KV starts at its restored external prefix.
+        let block = u64::from(self.block_size);
+        let restored = u64::from(restored_tokens);
+        let bytes = |tokens: u64| {
+            ((restored + tokens).div_ceil(block) * block - restored)
+                * self.kv_bytes_per_token_per_device
+                + self.kv_bytes_per_request_per_device
+        };
+        let remaining = u64::from(known_tokens.saturating_sub(restored_tokens).max(1));
+        let chunk = remaining.min(u64::from(self.effective_max_num_batched_tokens));
+        let needed = bytes(chunk + u64::from(self.num_lookahead_tokens));
+        if self.scheduler_reserve_full_isl {
+            needed.max(bytes(remaining))
+        } else {
+            needed
+        }
+    }
+    fn set_external_pending(&mut self, request_id: u64, pending: bool) {
+        if pending {
+            self.external_pending.insert(request_id);
+        } else {
+            self.external_pending.remove(&request_id);
+        }
+    }
+    fn external_lookup(&self) -> Option<u64> {
+        // V1 prices this step's running chunks, then admits requests holding
+        // loaded KV. A lookup takes no slot or budget, but needs both left
+        // unless loads may start without them, up to the in-flight limit.
+        if self.running_wait() {
+            return None;
+        }
+        let blocked = |r: &&RunningRequest| {
+            self.external_blocked.contains(&r.request_id)
+                || self.external_admission.contains(&r.request_id)
+        };
+        let (running, waiting): (Vec<_>, Vec<_>) = self
+            .queue
+            .iter()
+            .partition(|r| self.admitted.contains(&r.completion_node_id));
+        let mut slots = self.effective_max_batch.saturating_sub(running.len());
+        let mut budget = self.effective_max_num_batched_tokens;
+        let mut inflight = self.external_admissions.len();
+        for request in &running {
+            if budget > 0 && !blocked(request) {
+                budget -= request.next_chunk(budget, self.block_size);
+            }
+        }
+        for request in &waiting {
+            if slots > 0 && budget > 0 && self.holds_external_kv(request) && !blocked(request) {
+                slots -= 1;
+                inflight -= 1;
+                budget -= request.next_chunk(budget, self.block_size);
+            }
+        }
+        let loads_only = slots == 0 || budget == 0;
+        if self
+            .max_num_inflight_kv_loads
+            .map_or(loads_only, |limit| inflight >= limit)
+        {
+            return None;
+        }
+        waiting
+            .into_iter()
+            .take_while(|r| !self.external_admission.contains(&r.request_id))
+            .find(|r| {
+                self.external_pending.contains(&r.request_id)
+                    && !self.external_blocked.contains(&r.request_id)
+            })
+            .map(|r| r.request_id)
+    }
+    fn reserve_external_admission(&mut self, request_id: u64, bytes: u64) {
+        if bytes == 0 {
+            self.external_admissions.remove(&request_id);
+        } else {
+            self.external_admissions.insert(request_id, bytes);
+        }
     }
     fn set_external_kv_reclaimable_bytes(&mut self, bytes: u64) {
         self.external_kv_reclaimable_bytes = bytes;
@@ -470,6 +604,7 @@ impl Scheduler for ChunkedPrefillScheduler {
             .find(|r| {
                 !self.external_blocked.contains(&r.request_id)
                     && !self.external_admission.contains(&r.request_id)
+                    && !self.external_pending.contains(&r.request_id)
             })
             .map(|r| {
                 let q = r
@@ -572,6 +707,9 @@ impl Scheduler for ChunkedPrefillScheduler {
         if self.block_size == 0 {
             bail!("block_size must be positive");
         }
+        if self.max_num_inflight_kv_loads == Some(0) {
+            bail!("max_num_inflight_kv_loads must be positive");
+        }
         if !self.device_mem_utilization.is_finite()
             || self.device_mem_utilization <= 0.0
             || self.device_mem_utilization > 1.0
@@ -606,7 +744,8 @@ impl Scheduler for ChunkedPrefillScheduler {
         Ok(())
     }
 
-    fn schedule(&mut self) -> Result<Vec<RequestState>> {
+    fn schedule(&mut self, now: f64) -> Result<Vec<RequestState>> {
+        self.iteration_start = now;
         if self.running || self.queue.is_empty() {
             return Ok(Vec::new());
         }
@@ -614,21 +753,29 @@ impl Scheduler for ChunkedPrefillScheduler {
         self.admission_waiting.clear();
         // External capacity waits retain the FCFS admission barrier. Transfer
         // preparation can be skipped, but later new work cannot bypass HBM waits.
-        let capacity_wait = self
-            .queue
-            .iter()
-            .any(|r| self.external_admission.contains(&r.request_id));
-        let mut capacity_barrier = self.queue.iter().any(|r| {
+        let capacity_wait = self.queue.iter().any(|r| {
             self.external_admission.contains(&r.request_id)
-                && self.admitted.contains(&r.completion_node_id)
+                || self.external_pending.contains(&r.request_id)
         });
+        let running_wait = self.running_wait();
+        let mut capacity_barrier = running_wait;
         let mut capacity_suffix = HashSet::new();
         for request in &self.queue {
             capacity_barrier |= self.external_admission.contains(&request.request_id);
-            if capacity_barrier && !self.admitted.contains(&request.completion_node_id) {
+            // Requests holding loaded KV pass a waiting request's HBM wait.
+            if capacity_barrier
+                && !self.admitted.contains(&request.completion_node_id)
+                && (running_wait || !self.holds_external_kv(request))
+            {
                 capacity_suffix.insert(request.completion_node_id);
             }
         }
+        let order: HashMap<NodeID, usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(position, r)| (r.completion_node_id, position))
+            .collect();
         let (mut queue, blocked): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.queue).into_iter().partition(|r| {
                 !self.external_blocked.contains(&r.request_id)
@@ -638,6 +785,12 @@ impl Scheduler for ChunkedPrefillScheduler {
             self.queue = blocked.into_iter().collect();
             return Ok(Vec::new());
         }
+        // V1 runs running requests, then those holding loaded KV, then the
+        // waiting queue.
+        queue.sort_by_key(|r| {
+            !self.admitted.contains(&r.completion_node_id) as u8
+                * (2 - self.holds_external_kv(r) as u8)
+        });
         let mut preempted = Vec::new();
         let mut batch = Vec::new();
         let mut budget = self.effective_max_num_batched_tokens;
@@ -660,6 +813,10 @@ impl Scheduler for ChunkedPrefillScheduler {
             if !is_running && capacity_suffix.contains(&queue[index].completion_node_id) {
                 self.admission_waiting
                     .extend(queue[index..].iter().map(|r| r.completion_node_id));
+                break;
+            }
+            // A call awaiting its KV lookup turn holds the queue, not HBM.
+            if !is_running && self.external_pending.contains(&queue[index].request_id) {
                 break;
             }
             let request = &mut queue[index];
@@ -690,18 +847,7 @@ impl Scheduler for ChunkedPrefillScheduler {
             });
             // Price the prospective prefix without touching the free queue.
             request.shared_kv_tokens = matched;
-            let mut q_len = request
-                .known_tokens
-                .saturating_sub(request.effective_kv_tokens())
-                .clamp(1, budget);
-            if request.align_state {
-                let checkpoint = request.replay_checkpoint(self.block_size);
-                if request.effective_kv_tokens() < checkpoint
-                    && request.effective_kv_tokens() + q_len > checkpoint
-                {
-                    q_len = checkpoint - request.effective_kv_tokens();
-                }
-            }
+            let q_len = request.next_chunk(budget, self.block_size);
             let old = self.private_bytes(request);
             let allocation = u64::from(q_len) + u64::from(self.num_lookahead_tokens);
             let needed = self.private_bytes_after(request, allocation, u64::from(q_len));
@@ -825,6 +971,7 @@ impl Scheduler for ChunkedPrefillScheduler {
             request.state_copies = request.state_copies_after(u64::from(q_len), self.block_size);
             request.private_capacity_tokens = u64::from(request.private_kv_tokens) + allocation;
             self.admitted.insert(request.completion_node_id);
+            self.external_admissions.remove(&request.request_id);
             batch.push(RequestState {
                 q_len,
                 kv_len: request.effective_kv_tokens(),
@@ -833,14 +980,24 @@ impl Scheduler for ChunkedPrefillScheduler {
             budget -= q_len;
             index += 1;
         }
-        // V1 prepends each victim to waiting. Running requests retain FCFS order.
+        // V1 prepends each victim to waiting. Running requests retain FCFS
+        // order, and so do waiting ones, including those loading external KV
+        // or waiting for HBM, which V1 keeps in place.
         let split = queue
             .iter()
             .position(|r| !self.admitted.contains(&r.completion_node_id))
             .unwrap_or(queue.len());
         let waiting = queue.split_off(split);
+        let (blocked_running, blocked_waiting): (Vec<_>, Vec<_>) = blocked
+            .into_iter()
+            .partition(|r| self.admitted.contains(&r.completion_node_id));
+        let mut waiting = blocked_waiting
+            .into_iter()
+            .chain(waiting)
+            .collect::<Vec<_>>();
+        waiting.sort_by_key(|r| order[&r.completion_node_id]);
+        queue.extend(blocked_running);
         queue.extend(preempted.into_iter().rev());
-        queue.extend(blocked);
         queue.extend(waiting);
         self.queue = queue.into_iter().collect();
         if !self.external_preemptions.is_empty() || self.external_reclaim.is_some() {
@@ -884,7 +1041,9 @@ impl Scheduler for ChunkedPrefillScheduler {
         let current_batch = std::mem::take(&mut self.current_batch);
 
         let mut tail = self.queue.split_off(current_batch.len());
+        let started = self.iteration_start;
         for (request, scheduled) in self.queue.iter_mut().zip(&current_batch) {
+            request.first_scheduled.get_or_insert(started);
             let previous_tokens = request.effective_kv_tokens();
             request.private_kv_tokens += scheduled.q_len;
             request.state_copies = 1;
@@ -933,8 +1092,11 @@ impl Scheduler for ChunkedPrefillScheduler {
         let mut completed = Vec::new();
         let mut next_queue = LinkedList::new();
         while let Some(mut request) = self.queue.pop_front() {
+            // Completion needs the whole prompt computed, even without outputs.
             let total_tokens = request.input_tokens + request.output_tokens;
-            if request.known_tokens >= total_tokens {
+            if request.known_tokens >= total_tokens
+                && request.effective_kv_tokens() >= request.input_tokens
+            {
                 self.admitted.remove(&request.completion_node_id);
                 request.release_state_source(&mut self.prefix_cache);
                 if self.enable_prefix_caching {
@@ -944,6 +1106,7 @@ impl Scheduler for ChunkedPrefillScheduler {
                     request_id: request.request_id,
                     subrequest_index: request.subrequest_index,
                     completion_node_id: request.completion_node_id,
+                    queue_wait: request.first_scheduled.map(|t| t - request.arrival_time),
                     token_latency: request.token_latency,
                 });
             } else {
@@ -1065,16 +1228,28 @@ mod tests {
         let mut scheduler = scheduler(4, false);
         scheduler.enqueue_sub_request(request(8, 2));
         state(&scheduler, 0, 1, 0);
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         state(&scheduler, 1, 0, 0);
         scheduler.done_iteration(1.0);
         state(&scheduler, 1, 0, 0);
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(2.0);
         state(&scheduler, 1, 0, 1);
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(3.0);
         state(&scheduler, 0, 0, 2);
+    }
+
+    #[test]
+    fn zero_output_completes_after_its_whole_prompt() {
+        let mut scheduler = scheduler(4, false);
+        scheduler.enqueue_sub_request(request(12, 0));
+        for (step, q_len) in [4, 4, 4].into_iter().enumerate() {
+            assert_eq!(scheduler.schedule(0.0).unwrap()[0].q_len, q_len);
+            let completed = scheduler.done_iteration(step as f64 + 1.0);
+            assert_eq!(completed.len(), usize::from(step == 2));
+        }
+        state(&scheduler, 0, 0, 0);
     }
 
     #[test]
@@ -1090,15 +1265,15 @@ mod tests {
         let mut seeded = request(12, 1);
         seeded.kv_tokens = 8;
         scheduler.enqueue_sub_request(seeded);
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].kv_len, batch[0].q_len), (8, 4));
         assert!(scheduler.set_external_kv_bytes(9).is_err());
         assert_eq!(scheduler.done_iteration(1.0).len(), 1);
         scheduler.set_external_kv_bytes(12).unwrap();
         scheduler.enqueue_sub_request(request(4, 1));
-        assert!(scheduler.schedule().is_err());
+        assert!(scheduler.schedule(0.0).is_err());
         scheduler.set_external_kv_bytes(8).unwrap();
-        assert_eq!(scheduler.schedule().unwrap()[0].q_len, 4);
+        assert_eq!(scheduler.schedule(0.0).unwrap()[0].q_len, 4);
     }
 
     #[test]
@@ -1114,7 +1289,7 @@ mod tests {
             let mut seeded = request(6, 1);
             seeded.kv_tokens = 5;
             scheduler.enqueue_sub_request(seeded);
-            let batch = scheduler.schedule();
+            let batch = scheduler.schedule(0.0);
             if capacity == 7 {
                 assert!(batch.is_err());
             } else {
@@ -1138,6 +1313,30 @@ mod tests {
     }
 
     #[test]
+    fn loaded_kv_runs_before_lookups_which_need_budget_or_a_limit() {
+        for limit in [None, Some(1)] {
+            let mut scheduler = scheduler(8, false);
+            scheduler.max_num_inflight_kv_loads = limit;
+            scheduler.configure_external_kv().unwrap();
+            // Request 0 awaits its lookup; request 1 behind it holds loaded KV.
+            for id in 0..2u64 {
+                let mut request = request(8, 1);
+                request.request_id = id;
+                request.completion_node_id = id as _;
+                scheduler.enqueue_sub_request(request);
+            }
+            scheduler.set_external_pending(0, true);
+            scheduler.reserve_external_admission(1, 8);
+            // Request 1 takes the whole budget; its admission frees its
+            // in-flight place.
+            assert_eq!(scheduler.external_lookup(), limit.map(|_| 0));
+            let batch = scheduler.schedule(0.0).unwrap();
+            assert_eq!((batch.len(), batch[0].q_len), (1, 8));
+            assert!(scheduler.admitted.contains(&1));
+        }
+    }
+
+    #[test]
     fn retained_admission_and_preemption_have_different_observations() {
         for memory in [12, 8] {
             let mut scheduler = scheduler(8, false);
@@ -1147,11 +1346,11 @@ mod tests {
                 request.completion_node_id = id;
                 scheduler.enqueue_sub_request(request);
             }
-            assert_eq!(scheduler.schedule().unwrap().len(), 2);
+            assert_eq!(scheduler.schedule(0.0).unwrap().len(), 2);
             scheduler.done_iteration(1.0);
             state(&scheduler, 2, 0, 2);
             scheduler.effective_max_num_batched_tokens = 1;
-            assert_eq!(scheduler.schedule().unwrap().len(), 1);
+            assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
             assert_eq!(scheduler.instance_load().running_requests, 1);
             if memory == 12 {
                 state(&scheduler, 2, 0, 2);
@@ -1168,12 +1367,12 @@ mod tests {
         seeded.kv_tokens = 7;
         scheduler.enqueue_sub_request(seeded);
         state(&scheduler, 0, 1, 0);
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         state(&scheduler, 1, 0, 0);
         scheduler.done_iteration(1.0);
         state(&scheduler, 0, 0, 1);
         scheduler.enqueue_sub_request(request(4, 0));
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(2.0);
         state(&scheduler, 0, 0, 1);
     }
@@ -1182,28 +1381,28 @@ mod tests {
     fn prefill_produces_the_first_token_without_an_extra_decode() {
         let mut scheduler = scheduler(16, false);
         scheduler.enqueue_sub_request(request(8, 1));
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!(batch[0].q_len, 8);
         assert_eq!(batch[0].kv_len, 0);
         let results = scheduler.done_iteration(0.5);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].token_latency, vec![0.5]);
-        assert!(scheduler.schedule().unwrap().is_empty());
+        assert!(scheduler.schedule(0.0).unwrap().is_empty());
     }
 
     #[test]
     fn chunked_prefill_emits_only_after_the_last_chunk() {
         let mut scheduler = scheduler(4, false);
         scheduler.enqueue_sub_request(request(8, 3));
-        assert_eq!(scheduler.schedule().unwrap()[0].q_len, 4);
+        assert_eq!(scheduler.schedule(0.0).unwrap()[0].q_len, 4);
         assert!(scheduler.done_iteration(1.0).is_empty());
         assert!(scheduler.queue.front().unwrap().token_latency.is_empty());
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 4));
         assert!(scheduler.done_iteration(2.0).is_empty());
         assert_eq!(scheduler.queue.front().unwrap().token_latency, vec![2.0]);
         for kv in 8..10 {
-            let batch = scheduler.schedule().unwrap();
+            let batch = scheduler.schedule(0.0).unwrap();
             assert_eq!((batch[0].q_len, batch[0].kv_len), (1, kv));
             let results = scheduler.done_iteration(f64::from(kv - 5));
             if kv == 9 {
@@ -1212,17 +1411,17 @@ mod tests {
                 assert!(results.is_empty());
             }
         }
-        assert!(scheduler.schedule().unwrap().is_empty());
+        assert!(scheduler.schedule(0.0).unwrap().is_empty());
     }
 
     #[test]
     fn full_prefix_hit_recomputes_the_last_block_for_logits() {
         let mut scheduler = scheduler(16, true);
         scheduler.enqueue_sub_request(request(8, 1));
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         assert_eq!(scheduler.done_iteration(1.0).len(), 1);
         scheduler.enqueue_sub_request(request(8, 1));
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 4));
         assert_eq!(scheduler.done_iteration(2.0).len(), 1);
     }
@@ -1231,11 +1430,11 @@ mod tests {
     fn eviction_after_completion_keeps_the_earlier_prefix_reusable() {
         let mut scheduler = scheduler(16, true);
         scheduler.enqueue_sub_request(request(12, 1));
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         assert_eq!(scheduler.done_iteration(1.0).len(), 1);
         assert!(scheduler.prefix_cache.evict_one());
         scheduler.enqueue_sub_request(request(12, 1));
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 8));
         assert_eq!(scheduler.done_iteration(2.0).len(), 1);
     }
@@ -1244,7 +1443,7 @@ mod tests {
     fn hashing_future_blocks_does_not_publish_uncomputed_kv() {
         let mut scheduler = scheduler(4, true);
         scheduler.enqueue_sub_request(request(20, 1));
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(1.0);
         let request = scheduler.queue.front().unwrap();
         assert_eq!(request.block_hashes.len(), 4);
@@ -1260,7 +1459,7 @@ mod tests {
         input.output_token_ids = Some((6..13).collect());
         scheduler.enqueue_sub_request(input);
         for time in 1_u32..=7 {
-            scheduler.schedule().unwrap();
+            scheduler.schedule(0.0).unwrap();
             let completed = scheduler.done_iteration(f64::from(time));
             let computed = 6 + time - 1;
             assert_eq!(
@@ -1276,7 +1475,7 @@ mod tests {
             }
         }
         scheduler.enqueue_sub_request(request(12, 1));
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 8));
     }
 
@@ -1308,14 +1507,14 @@ mod tests {
     fn failed_admission_releases_acquired_blocks_for_retry() {
         let mut scheduler = scheduler(16, true);
         scheduler.enqueue_sub_request(request(12, 1));
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(1.0);
         scheduler.usable_device_mem = 8;
         scheduler.enqueue_sub_request(request(12, 1));
-        assert!(scheduler.schedule().is_err());
+        assert!(scheduler.schedule(0.0).is_err());
         assert_eq!(scheduler.queue.front().unwrap().shared_kv_tokens, 0);
         scheduler.usable_device_mem = 12;
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 8));
         assert_eq!(scheduler.done_iteration(2.0).len(), 1);
         for _ in 0..3 {
@@ -1344,7 +1543,7 @@ mod tests {
                 input.output_token_ids = Some(vec![8]);
             }
             scheduler.enqueue_sub_request(input);
-            scheduler.schedule().unwrap();
+            scheduler.schedule(0.0).unwrap();
             scheduler.done_iteration(1.0);
             assert_eq!(
                 scheduler.queue.front().unwrap().block_hashes.is_empty(),

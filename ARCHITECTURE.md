@@ -133,8 +133,9 @@ loads. Routed children enter the graph beneath that arrival event.
 
 - Workload JSONL is the only input format: one request DAG per row. Each LLM
   sub-request carries its own full context; runtime never reconstructs context
-  from predecessors. Optional token traces or namespaced full-block identities
-  prove reusable input; generated KV does not implicitly identify a later input.
+  from predecessors' execution. Optional token traces or namespaced full-block
+  identities prove reusable input; a block identity list may extend an earlier
+  call's list in the same row. Generated KV does not implicitly identify a later input.
 - Result JSONL repeats the input DAG and adds one `token_latency` array per LLM
   sub-request: TTFT first, then inter-token latencies.
 - A scenario is one TOML tree whose `kind` fields select registered

@@ -1,15 +1,13 @@
 use std::any::Any;
-use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::module::Module;
 use crate::network_sim::NetworkSimulator;
-use crate::types::{NetworkDeviceID, PollResult};
+use crate::types::{NetworkDeviceID, NodeID, PollResult};
 
 type FlowID = u64;
 
@@ -26,7 +24,7 @@ struct DirectionalLink {
     name: String,
     bandwidth: f64,
     latency: f64,
-    active_flows: BTreeSet<FlowID>,
+    active_flows: BTreeMap<FlowID, *mut FlowTransferState>,
     bytes: f64,
     busy_seconds: f64,
     peak_flows: usize,
@@ -46,11 +44,34 @@ struct FlowTransferState {
     remaining_bytes: f64,
     propagation_remaining: f64,
     weight: f64,
+    /// Max-min fair rate; valid while `rates_valid`.
+    rate: f64,
+    /// Dense index while rates are computed.
+    slot: usize,
+}
+
+/// Buffers reused across rate computations.
+#[derive(Debug, Default)]
+struct RateScratch {
+    /// Directional link index -> active link index.
+    link_of: Vec<usize>,
+    capacity: Vec<f64>,
+    demand: Vec<f64>,
+    unfixed: Vec<usize>,
+    /// Flow slots per active link, delimited by `starts`.
+    members: Vec<usize>,
+    starts: Vec<usize>,
+    flows: Vec<*mut FlowTransferState>,
+    fixed: Vec<bool>,
+    saturated: Vec<usize>,
 }
 
 #[derive(Debug)]
 struct TransferState {
     flows: Vec<Box<FlowTransferState>>,
+    node: NodeID,
+    /// When the engine polls this transfer next.
+    wake: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +118,10 @@ pub struct FlowNetworkSimulator {
     #[serde(skip_deserializing, default)]
     waypoints: HashMap<(NetworkDeviceID, NetworkDeviceID), Vec<NetworkDeviceID>>,
 
+    /// A route segment between two domain devices uses only links inside it.
+    #[serde(skip_deserializing, default)]
+    domain: HashSet<NetworkDeviceID>,
+
     #[serde(skip_deserializing, default)]
     bound_routes:
         HashMap<(NetworkDeviceID, NetworkDeviceID), (NetworkDeviceID, Vec<NetworkDeviceID>)>,
@@ -108,9 +133,32 @@ pub struct FlowNetworkSimulator {
     #[serde(skip_deserializing, default)]
     flow_states: HashMap<FlowID, *mut FlowTransferState>,
 
-    /// Rates for the current active flow set; cleared when it changes.
+    /// Flow rates depend only on the active flow set.
     #[serde(skip_deserializing, default)]
-    rates: RefCell<Option<Rc<HashMap<FlowID, f64>>>>,
+    rates_valid: bool,
+
+    /// Rates changed since pending transfers were last checked for wake-ups.
+    #[serde(skip_deserializing, default)]
+    rates_changed: bool,
+
+    /// Pending transfers by engine node.
+    #[serde(skip_deserializing, default)]
+    transfers: HashMap<NodeID, *mut TransferState>,
+
+    /// Polls brought forward since the engine last asked, and the time of the
+    /// poll in progress, before which none may land.
+    #[serde(skip_deserializing, default)]
+    wakeups: Vec<(NodeID, f64)>,
+    #[serde(skip_deserializing, default)]
+    poll_time: f64,
+
+    #[serde(skip_deserializing, default)]
+    scratch: RateScratch,
+
+    /// Next flow event after reconciling at `time`; `None` when flow state
+    /// changed since. Polls at one timestamp share it.
+    #[serde(skip_deserializing, default)]
+    settled: Option<Option<f64>>,
 }
 
 crate::register_network_simulator!(FlowNetworkSimulator, "flow");
@@ -238,15 +286,6 @@ impl FlowNetworkSimulator {
         Ok((src, handle))
     }
 
-    pub fn check_waypoints(
-        &self,
-        src: NetworkDeviceID,
-        dst: NetworkDeviceID,
-        via: &[NetworkDeviceID],
-    ) -> Result<()> {
-        self.routes_via(src, dst, via).map(|_| ())
-    }
-
     fn describe_route(&self, route: &Route) -> RouteInfo {
         RouteInfo {
             links: route.link_indices.clone(),
@@ -271,38 +310,55 @@ impl FlowNetworkSimulator {
             .collect())
     }
 
-    pub fn check_route(&self, src: NetworkDeviceID, dst: NetworkDeviceID) -> Result<()> {
+    /// Confines route segments between `devices` to links among them.
+    pub fn confine(&mut self, devices: HashSet<NetworkDeviceID>) {
+        self.domain = devices;
+        self.routes.clear();
+    }
+
+    pub fn confined(&self, src: NetworkDeviceID, dst: NetworkDeviceID) -> bool {
+        self.domain.contains(&src) && self.domain.contains(&dst)
+    }
+
+    /// Links at `node` from `adjacency`, only those inside the domain if `confined`.
+    fn links_at<'a>(
+        &'a self,
+        adjacency: &'a HashMap<NetworkDeviceID, Vec<usize>>,
+        node: NetworkDeviceID,
+        confined: bool,
+    ) -> impl DoubleEndedIterator<Item = usize> + 'a {
+        adjacency
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |&index| {
+                !confined || self.confined(self.links[index].src, self.links[index].dst)
+            })
+    }
+
+    pub fn reachable(&self, src: NetworkDeviceID, confined: bool) -> HashSet<NetworkDeviceID> {
         let mut seen = HashSet::from([src]);
         let mut pending = VecDeque::from([src]);
         while let Some(node) = pending.pop_front() {
-            if node == dst {
-                return Ok(());
-            }
-            for &index in self.outgoing_links.get(&node).into_iter().flatten() {
+            for index in self.links_at(&self.outgoing_links, node, confined) {
                 if seen.insert(self.links[index].dst) {
                     pending.push_back(self.links[index].dst);
                 }
             }
         }
-        bail!("no directed route from {src} to {dst}")
+        seen
     }
 
+    /// Route `src -> dst` through `via`; checked when first used.
     pub fn set_waypoints(
         &mut self,
         src: NetworkDeviceID,
         dst: NetworkDeviceID,
         via: Vec<NetworkDeviceID>,
-    ) -> Result<()> {
-        let stops = std::iter::once(src)
-            .chain(via.iter().copied())
-            .chain(std::iter::once(dst))
-            .collect::<Vec<_>>();
-        for segment in stops.windows(2) {
-            self.check_route(segment[0], segment[1])?;
-        }
+    ) {
         self.waypoints.insert((src, dst), via);
         self.routes.remove(&(src, dst));
-        Ok(())
     }
 
     fn find_equal_shortest_routes(
@@ -310,11 +366,12 @@ impl FlowNetworkSimulator {
         src: NetworkDeviceID,
         dst: NetworkDeviceID,
     ) -> Result<Vec<Route>> {
+        let confined = self.confined(src, dst);
         let mut distance = HashMap::from([(dst, 0usize)]);
         let mut pending = VecDeque::from([dst]);
         while let Some(node) = pending.pop_front() {
             let next_distance = distance[&node] + 1;
-            for &index in self.incoming_links.get(&node).into_iter().flatten() {
+            for index in self.links_at(&self.incoming_links, node, confined) {
                 let link = &self.links[index];
                 if let std::collections::hash_map::Entry::Vacant(entry) = distance.entry(link.src) {
                     entry.insert(next_distance);
@@ -335,7 +392,7 @@ impl FlowNetworkSimulator {
                 });
                 continue;
             }
-            for &index in self.outgoing_links.get(&node).into_iter().flatten().rev() {
+            for index in self.links_at(&self.outgoing_links, node, confined).rev() {
                 let link = &self.links[index];
                 if distance
                     .get(&link.dst)
@@ -351,7 +408,8 @@ impl FlowNetworkSimulator {
     }
 
     fn find_shortest_route(&self, src: NetworkDeviceID, dst: NetworkDeviceID) -> Result<Route> {
-        let bandwidth = self.widest_bandwidth(src, dst)?;
+        let confined = self.confined(src, dst);
+        let bandwidth = self.widest_bandwidth(src, dst, confined)?;
         let mut frontier = HashMap::new();
         frontier.insert(
             src,
@@ -374,11 +432,7 @@ impl FlowNetworkSimulator {
                 .get(&current_node)
                 .cloned()
                 .ok_or_else(|| anyhow!("path frontier disappeared during route search"))?;
-            let Some(outgoing) = self.outgoing_links.get(&current_node) else {
-                continue;
-            };
-
-            for &link_index in outgoing {
+            for link_index in self.links_at(&self.outgoing_links, current_node, confined) {
                 let link = &self.links[link_index];
                 if link.bandwidth < bandwidth || settled.contains(&link.dst) {
                     continue;
@@ -421,7 +475,12 @@ impl FlowNetworkSimulator {
         })
     }
 
-    fn widest_bandwidth(&self, src: NetworkDeviceID, dst: NetworkDeviceID) -> Result<f64> {
+    fn widest_bandwidth(
+        &self,
+        src: NetworkDeviceID,
+        dst: NetworkDeviceID,
+        confined: bool,
+    ) -> Result<f64> {
         let mut widths = HashMap::from([(src, f64::INFINITY)]);
         let mut settled = HashSet::new();
         loop {
@@ -436,7 +495,7 @@ impl FlowNetworkSimulator {
                 return Ok(width);
             }
             settled.insert(node);
-            for &index in self.outgoing_links.get(&node).into_iter().flatten() {
+            for index in self.links_at(&self.outgoing_links, node, confined) {
                 let link = &self.links[index];
                 let candidate = width.min(link.bandwidth);
                 widths
@@ -505,29 +564,14 @@ impl FlowNetworkSimulator {
         delta.is_finite() && delta > 0.0 && now + delta > now
     }
 
-    fn flow_ids(&self) -> Vec<FlowID> {
-        self.flow_states.keys().copied().collect()
+    fn flows(&self) -> impl Iterator<Item = &FlowTransferState> + '_ {
+        // NOTE: Safety: flow states are boxed in network node state and
+        // unregistered before their node drops them.
+        self.flow_states.values().map(|&flow| unsafe { &*flow })
     }
 
-    fn flow_ptr(&self, flow_id: FlowID) -> Result<*mut FlowTransferState> {
-        self.flow_states
-            .get(&flow_id)
-            .copied()
-            .ok_or_else(|| anyhow!("network flow {flow_id} is not registered"))
-    }
-
-    fn with_flow<R>(&self, flow_id: FlowID, f: impl FnOnce(&FlowTransferState) -> R) -> Result<R> {
-        let ptr = self.flow_ptr(flow_id)?;
-        Ok(unsafe { f(&*ptr) })
-    }
-
-    fn with_flow_mut<R>(
-        &mut self,
-        flow_id: FlowID,
-        f: impl FnOnce(&mut FlowTransferState) -> R,
-    ) -> Result<R> {
-        let ptr = self.flow_ptr(flow_id)?;
-        Ok(unsafe { f(&mut *ptr) })
+    fn flows_mut(&mut self) -> impl Iterator<Item = &mut FlowTransferState> + '_ {
+        self.flow_states.values().map(|&flow| unsafe { &mut *flow })
     }
 
     fn downcast_state_mut(state: &mut Option<Box<dyn Any>>) -> Result<Option<&mut TransferState>> {
@@ -540,26 +584,21 @@ impl FlowNetworkSimulator {
         }
     }
 
-    fn ensure_flow_state(
+    fn register(
         &mut self,
+        node: NodeID,
         src: NetworkDeviceID,
         dst: NetworkDeviceID,
         bytes: u64,
         state: &mut Option<Box<dyn Any>>,
-    ) -> Result<Vec<FlowID>> {
-        if let Some(transfer) = Self::downcast_state_mut(state)? {
-            return Ok(transfer.flows.iter().map(|flow| flow.flow_id).collect());
-        }
-
-        if bytes == 0 || src == dst {
-            return Ok(Vec::new());
-        }
-
+    ) -> Result<()> {
         let routes = self.route_for(src, dst)?;
         let count = routes.len().min(bytes as usize);
-        let mut transfer = TransferState {
+        let mut transfer = Box::new(TransferState {
             flows: Vec::with_capacity(count),
-        };
+            node,
+            wake: self.time,
+        });
         for (index, route) in routes.into_iter().take(count).enumerate() {
             let payload = bytes / count as u64 + u64::from((index as u64) < bytes % count as u64);
             let flow_id = self.next_flow_id;
@@ -571,260 +610,271 @@ impl FlowNetworkSimulator {
                 remaining_bytes: payload as f64,
                 propagation_remaining: 0.0,
                 weight: 1.0 / count as f64,
+                rate: 0.0,
+                slot: 0,
             });
             let flow_ptr = (&mut *flow) as *mut FlowTransferState;
             for &link_index in &flow.route.link_indices {
                 let link = &mut self.links[link_index];
-                link.active_flows.insert(flow_id);
+                link.active_flows.insert(flow_id, flow_ptr);
                 link.peak_flows = link.peak_flows.max(link.active_flows.len());
             }
             self.flow_states.insert(flow_id, flow_ptr);
-            self.rates.take();
             transfer.flows.push(flow);
         }
-        let ids = transfer.flows.iter().map(|flow| flow.flow_id).collect();
-        *state = Some(Box::new(transfer));
-        Ok(ids)
+        self.rates_valid = false;
+        self.settled = None;
+        self.transfers.insert(node, &mut *transfer);
+        *state = Some(transfer);
+        Ok(())
     }
 
     /// Weighted max-min fair rates by progressive filling: links that saturate
     /// first fix their flows; capacity a flow cannot use elsewhere stays with
     /// the others, as in work-conserving link arbitration. Rates depend only on
-    /// the active flow set, so they are cached until it changes.
-    fn active_rates(&self) -> Rc<HashMap<FlowID, f64>> {
-        if let Some(rates) = self.rates.borrow().as_ref() {
-            return rates.clone();
+    /// the active flow set, so they are kept until it changes.
+    fn update_rates(&mut self) {
+        if self.rates_valid {
+            return;
         }
-        let mut index = HashMap::new();
-        let (mut ids, mut weights, mut flow_links) =
-            (Vec::new(), Vec::new(), Vec::<Vec<usize>>::new());
-        let (mut capacity, mut link_flows) = (Vec::new(), Vec::<Vec<usize>>::new());
-        for link in self
-            .links
-            .iter()
-            .filter(|link| !link.active_flows.is_empty())
-        {
-            let l = capacity.len();
-            capacity.push(link.bandwidth);
-            let mut members = Vec::with_capacity(link.active_flows.len());
-            for &flow_id in &link.active_flows {
-                let f = *index.entry(flow_id).or_insert_with(|| {
-                    ids.push(flow_id);
-                    weights.push(unsafe { (*self.flow_states[&flow_id]).weight });
-                    flow_links.push(Vec::new());
-                    ids.len() - 1
-                });
-                flow_links[f].push(l);
-                members.push(f);
+        self.rates_valid = true;
+        self.rates_changed = true;
+        for flow in self.flows_mut() {
+            flow.rate = 0.0;
+            flow.slot = usize::MAX;
+        }
+        let RateScratch {
+            link_of,
+            capacity,
+            demand,
+            unfixed,
+            members,
+            starts,
+            flows,
+            fixed,
+            saturated,
+        } = &mut self.scratch;
+        link_of.resize(self.links.len(), usize::MAX);
+        capacity.clear();
+        demand.clear();
+        unfixed.clear();
+        members.clear();
+        starts.clear();
+        flows.clear();
+        fixed.clear();
+        for (index, link) in self.links.iter().enumerate() {
+            if link.active_flows.is_empty() {
+                continue;
             }
-            link_flows.push(members);
+            link_of[index] = capacity.len();
+            capacity.push(link.bandwidth);
+            starts.push(members.len());
+            let mut weight = 0.0;
+            for &flow in link.active_flows.values() {
+                let flow = unsafe { &mut *flow };
+                if flow.slot == usize::MAX {
+                    flow.slot = flows.len();
+                    flows.push(flow);
+                    fixed.push(false);
+                }
+                weight += flow.weight;
+                members.push(flow.slot);
+            }
+            demand.push(weight);
+            unfixed.push(link.active_flows.len());
         }
-        let mut demand: Vec<f64> = link_flows
-            .iter()
-            .map(|members| members.iter().map(|&f| weights[f]).sum())
-            .collect();
-        let mut unfixed: Vec<usize> = link_flows.iter().map(Vec::len).collect();
-        let mut rate = vec![None; ids.len()];
-        let mut remaining = ids.len();
+        starts.push(members.len());
+        let mut remaining = flows.len();
         while remaining > 0 {
             let share = |l: usize| capacity[l].max(0.0) / demand[l];
             let level = (0..capacity.len())
                 .filter(|&l| unfixed[l] > 0)
                 .map(share)
                 .fold(f64::INFINITY, f64::min);
-            let saturated = (0..capacity.len())
-                .filter(|&l| unfixed[l] > 0 && share(l) <= level * (1.0 + RELATIVE_BYTES_EPSILON))
-                .collect::<Vec<_>>();
-            for l in saturated {
-                for &f in &link_flows[l] {
-                    if rate[f].is_some() {
+            saturated.clear();
+            saturated.extend(
+                (0..capacity.len()).filter(|&l| {
+                    unfixed[l] > 0 && share(l) <= level * (1.0 + RELATIVE_BYTES_EPSILON)
+                }),
+            );
+            for &l in saturated.iter() {
+                for &f in &members[starts[l]..starts[l + 1]] {
+                    if fixed[f] {
                         continue;
                     }
-                    let fixed = weights[f] * level;
-                    rate[f] = Some(fixed);
+                    fixed[f] = true;
                     remaining -= 1;
-                    for &k in &flow_links[f] {
-                        capacity[k] -= fixed;
-                        demand[k] -= weights[f];
+                    let flow = unsafe { &mut *flows[f] };
+                    flow.rate = flow.weight * level;
+                    for &link in &flow.route.link_indices {
+                        let k = link_of[link];
+                        capacity[k] -= flow.rate;
+                        demand[k] -= flow.weight;
                         unfixed[k] -= 1;
                     }
                 }
             }
         }
-        let rates = Rc::new(
-            ids.into_iter()
-                .zip(rate.into_iter().map(Option::unwrap))
-                .collect(),
-        );
-        *self.rates.borrow_mut() = Some(Rc::clone(&rates));
-        rates
     }
 
-    fn snap_small_residuals(&mut self) -> Result<bool> {
+    fn snap_small_residuals(&mut self) -> bool {
         let mut changed = false;
-        for flow_id in self.flow_ids() {
-            self.with_flow_mut(flow_id, |flow| {
-                let snapped_bytes =
-                    Self::snap_bytes_to_zero(flow.remaining_bytes, flow.total_bytes);
-                if snapped_bytes != flow.remaining_bytes {
-                    flow.remaining_bytes = snapped_bytes;
-                    changed = true;
-                }
-
-                let snapped_time =
-                    Self::snap_time_to_zero(flow.propagation_remaining, flow.route.total_latency);
-                if snapped_time != flow.propagation_remaining {
-                    flow.propagation_remaining = snapped_time;
-                    changed = true;
-                }
-            })?;
+        for flow in self.flows_mut() {
+            let bytes = Self::snap_bytes_to_zero(flow.remaining_bytes, flow.total_bytes);
+            let time =
+                Self::snap_time_to_zero(flow.propagation_remaining, flow.route.total_latency);
+            changed |= bytes != flow.remaining_bytes || time != flow.propagation_remaining;
+            flow.remaining_bytes = bytes;
+            flow.propagation_remaining = time;
         }
-        Ok(changed)
+        changed
     }
 
-    fn snap_unobservable_progress(&mut self) -> Result<bool> {
-        let rates = self.active_rates();
-        let mut data_done = Vec::new();
-        let mut prop_done = Vec::new();
-
-        for flow_id in self.flow_ids() {
-            self.with_flow(flow_id, |flow| {
-                if flow.remaining_bytes > 0.0 {
-                    let rate = rates.get(&flow_id).copied().unwrap_or(0.0);
-                    if rate > 0.0 {
-                        let delay = flow.remaining_bytes / rate;
-                        if !Self::advances_time(self.time, delay) {
-                            data_done.push(flow_id);
-                        }
-                    }
-                } else if flow.propagation_remaining > 0.0
-                    && !Self::advances_time(self.time, flow.propagation_remaining)
-                {
-                    prop_done.push(flow_id);
+    fn snap_unobservable_progress(&mut self) -> bool {
+        self.update_rates();
+        let now = self.time;
+        let mut changed = false;
+        for flow in self.flows_mut() {
+            if flow.remaining_bytes > 0.0 {
+                if flow.rate > 0.0 && !Self::advances_time(now, flow.remaining_bytes / flow.rate) {
+                    flow.remaining_bytes = 0.0;
+                    changed = true;
                 }
-            })?;
-        }
-
-        let changed = !data_done.is_empty() || !prop_done.is_empty();
-        for flow_id in data_done {
-            self.with_flow_mut(flow_id, |flow| {
-                flow.remaining_bytes = 0.0;
-            })?;
-        }
-        for flow_id in prop_done {
-            self.with_flow_mut(flow_id, |flow| {
+            } else if flow.propagation_remaining > 0.0
+                && !Self::advances_time(now, flow.propagation_remaining)
+            {
                 flow.propagation_remaining = 0.0;
-            })?;
+                changed = true;
+            }
         }
-        Ok(changed)
+        changed
     }
 
-    fn reconcile_flow_states(&mut self) -> Result<()> {
+    fn reconcile_flow_states(&mut self) {
         loop {
             let mut changed = false;
-            changed |= self.snap_small_residuals()?;
-            changed |= self.snap_unobservable_progress()?;
-            changed |= self.begin_propagation()?;
-            changed |= self.snap_small_residuals()?;
-            changed |= self.snap_unobservable_progress()?;
+            changed |= self.snap_small_residuals();
+            changed |= self.snap_unobservable_progress();
+            changed |= self.begin_propagation();
+            changed |= self.snap_small_residuals();
+            changed |= self.snap_unobservable_progress();
             if !changed {
                 break;
             }
         }
-        Ok(())
     }
 
-    fn next_event_delay(&self) -> Result<Option<f64>> {
-        let rates = self.active_rates();
-        let mut next_delay: Option<f64> = None;
-        for flow_id in self.flow_ids() {
-            self.with_flow(flow_id, |flow| {
-                if flow.remaining_bytes > 0.0 {
-                    let rate = *rates.get(&flow_id).unwrap_or(&0.0);
-                    if rate > 0.0 {
-                        let delay = flow.remaining_bytes / rate;
-                        next_delay = Some(next_delay.map_or(delay, |current| current.min(delay)));
-                    }
-                } else if flow.propagation_remaining > 0.0 {
-                    next_delay = Some(next_delay.map_or(flow.propagation_remaining, |current| {
-                        current.min(flow.propagation_remaining)
-                    }));
-                }
-            })?;
+    /// Reconcile flow state at `time` and return the delay to the next flow event.
+    fn settle(&mut self) -> Option<f64> {
+        if let Some(next) = self.settled {
+            return next;
         }
-        Ok(next_delay)
+        self.reconcile_flow_states();
+        self.update_rates();
+        let next = self.flows().filter_map(Self::flow_event).reduce(f64::min);
+        self.settled = Some(next);
+        if std::mem::take(&mut self.rates_changed) {
+            // A rate change can only advance a transfer's next event here; a
+            // delayed one is polled early and answers again.
+            let floor = self.poll_time.max(self.time);
+            for (&node, &transfer) in &self.transfers {
+                let transfer = unsafe { &mut *transfer };
+                if let Some(delay) = Self::transfer_event(transfer) {
+                    let wake = (self.time + delay).max(floor);
+                    if wake < transfer.wake {
+                        transfer.wake = wake;
+                        self.wakeups.push((node, wake));
+                    }
+                }
+            }
+        }
+        next
+    }
+
+    /// Delay to a flow's next event: transmission ending, which changes rates,
+    /// or its last bit arriving.
+    fn flow_event(flow: &FlowTransferState) -> Option<f64> {
+        if flow.remaining_bytes > 0.0 {
+            (flow.rate > 0.0).then(|| flow.remaining_bytes / flow.rate)
+        } else {
+            (flow.propagation_remaining > 0.0).then_some(flow.propagation_remaining)
+        }
+    }
+
+    fn transfer_event(transfer: &TransferState) -> Option<f64> {
+        transfer
+            .flows
+            .iter()
+            .filter_map(|flow| Self::flow_event(flow))
+            .reduce(f64::min)
     }
 
     fn release_flow_links(&mut self, flow_id: FlowID, route: &Route) {
-        self.rates.take();
         for &link_index in &route.link_indices {
-            self.links[link_index].active_flows.remove(&flow_id);
-        }
-    }
-
-    fn begin_propagation(&mut self) -> Result<bool> {
-        let mut finished_tx = Vec::new();
-        for flow_id in self.flow_ids() {
-            let still_active = self.with_flow(flow_id, |flow| {
-                flow.route
-                    .link_indices
-                    .iter()
-                    .any(|&link_index| self.links[link_index].active_flows.contains(&flow_id))
-                    && flow.remaining_bytes == 0.0
-            })?;
-            if still_active {
-                finished_tx.push(flow_id);
+            if self.links[link_index]
+                .active_flows
+                .remove(&flow_id)
+                .is_some()
+            {
+                self.rates_valid = false;
+                self.settled = None;
             }
         }
-
-        let changed = !finished_tx.is_empty();
-        for flow_id in finished_tx {
-            let route = self.with_flow(flow_id, |flow| flow.route.clone())?;
-            self.release_flow_links(flow_id, &route);
-            self.with_flow_mut(flow_id, |flow| {
-                flow.propagation_remaining = route.total_latency;
-            })?;
-        }
-        Ok(changed)
     }
 
-    fn advance(&mut self, until_s: f64) -> Result<()> {
+    fn begin_propagation(&mut self) -> bool {
+        let finished = self
+            .flows()
+            .filter(|flow| {
+                flow.remaining_bytes == 0.0
+                    && flow
+                        .route
+                        .link_indices
+                        .iter()
+                        .any(|&link| self.links[link].active_flows.contains_key(&flow.flow_id))
+            })
+            .map(|flow| (flow.flow_id, flow.route.clone()))
+            .collect::<Vec<_>>();
+        let changed = !finished.is_empty();
+        for (flow_id, route) in finished {
+            self.release_flow_links(flow_id, &route);
+            unsafe { (*self.flow_states[&flow_id]).propagation_remaining = route.total_latency };
+        }
+        changed
+    }
+
+    fn advance(&mut self, until_s: f64) {
         while self.time < until_s {
-            self.reconcile_flow_states()?;
-            let Some(next_event_delay) = self.next_event_delay()? else {
+            let Some(next_event_delay) = self.settle() else {
                 self.time = until_s;
-                return Ok(());
+                return;
             };
             let step_s = (until_s - self.time).min(next_event_delay);
-            let rates = self.active_rates();
             for link in &mut self.links {
                 if !link.active_flows.is_empty() {
                     link.busy_seconds += step_s;
                     link.bytes += link
                         .active_flows
-                        .iter()
-                        .map(|id| rates[id] * step_s)
+                        .values()
+                        .map(|&flow| unsafe { (*flow).rate } * step_s)
                         .sum::<f64>();
                 }
             }
-            for flow_id in self.flow_ids() {
-                self.with_flow_mut(flow_id, |flow| {
-                    if flow.remaining_bytes > 0.0 {
-                        let rate = *rates.get(&flow_id).unwrap_or(&0.0);
-                        flow.remaining_bytes = (flow.remaining_bytes - rate * step_s).max(0.0);
-                    } else if flow.propagation_remaining > 0.0 {
-                        flow.propagation_remaining = (flow.propagation_remaining - step_s).max(0.0);
-                    }
-                })?;
+            for flow in self.flows_mut() {
+                if flow.remaining_bytes > 0.0 {
+                    flow.remaining_bytes = (flow.remaining_bytes - flow.rate * step_s).max(0.0);
+                } else if flow.propagation_remaining > 0.0 {
+                    flow.propagation_remaining = (flow.propagation_remaining - step_s).max(0.0);
+                }
             }
             self.time += step_s;
-            self.reconcile_flow_states()?;
+            self.settled = None;
+            self.settle();
 
             if step_s + f64::EPSILON < next_event_delay {
                 break;
             }
         }
-        Ok(())
     }
 }
 
@@ -854,6 +904,7 @@ impl NetworkSimulator for FlowNetworkSimulator {
 
     fn simulate(
         &mut self,
+        node: NodeID,
         src: NetworkDeviceID,
         dst: NetworkDeviceID,
         bytes: u64,
@@ -863,34 +914,41 @@ impl NetworkSimulator for FlowNetworkSimulator {
         if !now.is_finite() || now < self.time {
             bail!("network time must be finite and nondecreasing");
         }
-        self.advance(now)?;
-        self.reconcile_flow_states()?;
-
-        let flow_ids = self.ensure_flow_state(src, dst, bytes, state)?;
-        if flow_ids.is_empty() {
-            return Ok(PollResult::Complete { latency: 0.0 });
-        }
-
-        let mut is_complete = true;
-        for &flow_id in &flow_ids {
-            is_complete &= self.with_flow(flow_id, |flow| {
-                flow.remaining_bytes == 0.0 && flow.propagation_remaining == 0.0
-            })?;
-        }
-        if is_complete {
-            for flow_id in flow_ids {
-                let route = self.with_flow(flow_id, |flow| flow.route.clone())?;
-                self.release_flow_links(flow_id, &route);
-                self.flow_states.remove(&flow_id);
+        self.poll_time = now;
+        self.advance(now);
+        if state.is_none() {
+            if bytes == 0 || src == dst {
+                return Ok(PollResult::Complete { latency: 0.0 });
             }
+            self.register(node, src, dst, bytes, state)?;
+            // Transfers starting together share one rate computation.
+            return Ok(PollResult::Deferred);
+        }
+        self.settle();
+        let transfer = Self::downcast_state_mut(state)?.unwrap();
+        if transfer
+            .flows
+            .iter()
+            .all(|flow| flow.remaining_bytes == 0.0 && flow.propagation_remaining == 0.0)
+        {
+            for flow in &transfer.flows {
+                self.release_flow_links(flow.flow_id, &flow.route);
+                self.flow_states.remove(&flow.flow_id);
+            }
+            self.transfers.remove(&transfer.node);
             *state = None;
             return Ok(PollResult::Complete { latency: 0.0 });
         }
-
-        let delay_s = self
-            .next_event_delay()?
+        // Each transfer is polled at its own next flow event; rate changes
+        // bring other transfers forward through `take_wakeups`.
+        let delay = Self::transfer_event(transfer)
             .ok_or_else(|| anyhow!("network flow has no active route bandwidth"))?;
-        Ok(PollResult::Pending { latency: delay_s })
+        transfer.wake = now + delay;
+        Ok(PollResult::Pending { latency: delay })
+    }
+
+    fn take_wakeups(&mut self) -> Vec<(NodeID, f64)> {
+        std::mem::take(&mut self.wakeups)
     }
 }
 
@@ -909,7 +967,8 @@ impl FlowNetworkSimulator {
         if !latency.is_finite() || latency < 0.0 {
             bail!("network link latency must be finite and non-negative");
         }
-        self.rates.take();
+        self.rates_valid = false;
+        self.settled = None;
         let link_index = self.links.len();
         self.links.push(DirectionalLink {
             src,
@@ -917,7 +976,7 @@ impl FlowNetworkSimulator {
             name,
             bandwidth,
             latency,
-            active_flows: BTreeSet::new(),
+            active_flows: BTreeMap::new(),
             bytes: 0.0,
             busy_seconds: 0.0,
             peak_flows: 0,

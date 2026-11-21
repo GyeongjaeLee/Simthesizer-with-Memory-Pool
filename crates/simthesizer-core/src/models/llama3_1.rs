@@ -368,10 +368,10 @@ mod tests {
                 kv_prefix: None,
             });
         }
-        assert_eq!(scheduler.schedule().unwrap().len(), 1);
+        assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
         assert_eq!(scheduler.done_iteration(1.0).len(), 1);
-        assert_eq!(scheduler.schedule().unwrap().len(), 1);
+        assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
         assert_eq!(scheduler.done_iteration(2.0).len(), 1);
-        assert!(scheduler.schedule().unwrap().is_empty());
+        assert!(scheduler.schedule(0.0).unwrap().is_empty());
     }
 }

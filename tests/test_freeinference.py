@@ -35,6 +35,21 @@ def nested(child_start=4, child_end=12):
                               call(15, 17, 1, "tool")])
 
 
+def with_deltas(source):
+    """A copy whose calls carry index block deltas instead of full lists."""
+    source = copy.deepcopy(source)
+    fi.attach_deltas(source, fi.extract_deltas(source))
+    return source
+
+
+def resolve(row, index):
+    """Full condensed IDs of a node, following identity parents."""
+    prefix = row["sub_requests"][index]["kv_prefix"]
+    if "parent" not in prefix:
+        return prefix["block_ids"]
+    return resolve(row, prefix["parent"])[:prefix["shared"]] + prefix["block_ids"]
+
+
 def reference_result(source, arrival=0):
     row, mapping = fi.native(source, 0, arrival)
     for entry in mapping:
@@ -123,7 +138,7 @@ class SessionConversionTests(unittest.TestCase):
             fi.native(source, 0, 0)
 
     def test_proxy_ids_are_not_model_tokens(self):
-        source = json.loads(json.dumps(nested()), object_hook=fi.projection)
+        source = fi.project(nested())
         self.assertEqual(source["requests"][0]["proxy_block_count"], 2)
         row, _ = fi.native(source, 0, 0)
         self.assertTrue(all("input_token_ids" not in n for n in row["sub_requests"]))
@@ -132,8 +147,20 @@ class SessionConversionTests(unittest.TestCase):
 
 class PrefixTests(unittest.TestCase):
     def proxy(self, source, **options):
-        return fi.native(source, 0, 0, token_mode="proxy-prefix",
+        return fi.native(with_deltas(source), 0, 0, token_mode="proxy-prefix",
                          target_model="target@revision", kv_layout="fp16:kv_heads=8:dim=128", **options)
+
+    def test_condensed_ids_keep_prompt_length_and_prefix_sharing(self):
+        a, b = list(range(40)), list(range(32)) + [99] * 8
+        self.assertEqual(len(fi.condense(a, 16)), 2)  # the partial third group is dropped
+        self.assertEqual(fi.condense(a, 16)[0], fi.condense(b, 16)[0])
+        self.assertNotEqual(fi.condense(a[:5] + [0] + a[6:], 16)[0], fi.condense(a, 16)[0])
+        source = fi.project(nested())
+        row, mapping = self.proxy(source, prefix_block_tokens=32)
+        node = row["sub_requests"][mapping[0]["subrequest_index"]]
+        self.assertEqual(node["input_tokens"], 32)
+        self.assertEqual(node["kv_prefix"]["block_tokens"], 32)
+        self.assertEqual(len(node["kv_prefix"]["block_ids"]), 1)
 
     def test_provider_count_keeps_provenance_without_cache_identity(self):
         source = nested()
@@ -180,7 +207,7 @@ class PrefixTests(unittest.TestCase):
         self.assertNotEqual(row["sub_requests"][1]["kv_prefix"]["namespace"], original)
         for key in ("target_model", "kv_layout"):
             options = {"target_model": "target@revision", "kv_layout": "fp16:kv_heads=8:dim=128", key: "changed"}
-            row, _ = fi.native(source, 0, 0, token_mode="proxy-prefix", **options)
+            row, _ = fi.native(with_deltas(source), 0, 0, token_mode="proxy-prefix", **options)
             self.assertNotEqual(row["sub_requests"][1]["kv_prefix"]["namespace"], original)
 
     def test_missing_invalid_or_partial_id_lists_are_never_reconstructed(self):
@@ -196,6 +223,32 @@ class PrefixTests(unittest.TestCase):
         source["requests"][0]["block_ids"] = []
         row, _ = self.proxy(source)
         self.assertEqual(row["sub_requests"][1]["input_tokens"], 0)
+
+    def test_identities_extend_the_previous_call_of_their_agent(self):
+        grow = lambda start, blocks: {**call(start, start + 1, start, "tool" if start else "user"),
+                                      "block_ids": blocks}
+        base = list(range(1, 9))
+        source = session("s", [grow(0, base), grow(2, base + [9, 10, 11, 12]),
+                               grow(4, base[:3] + [20, 21, 22, 23, 24]), grow(6, base[:3] + [20, 21, 22, 23, 24])])
+        source["requests"][3]["model"] = "another-model"
+        for group, tokens in ((1, 16), (2, 32), (4, 64)):
+            with self.subTest(group=group):
+                row, mapping = self.proxy(source, prefix_block_tokens=tokens)
+                llms = [m["subrequest_index"] for m in mapping]
+                full = [r["block_ids"] for r in source["requests"]]
+                for index, blocks in zip(llms, full):
+                    expected = blocks if group == 1 else fi.condense(blocks, group)
+                    self.assertEqual(resolve(row, index), expected)
+                prefixes = [row["sub_requests"][i]["kv_prefix"] for i in llms]
+                self.assertNotIn("parent", prefixes[0])
+                self.assertEqual((prefixes[1]["parent"], prefixes[1]["shared"]), (llms[0], 8 // group))
+                self.assertEqual(prefixes[2].get("shared", 0), 3 // group)
+                self.assertNotIn("parent", prefixes[3])  # another model: another namespace
+        row, _ = self.proxy(source)
+        cut, kept = fi.truncate(row, 5)
+        third = cut["sub_requests"][kept[llms[2]]]["kv_prefix"]
+        self.assertEqual(third["parent"], kept[llms[1]])
+        self.assertEqual(resolve(cut, kept[llms[2]]), full[2])
 
     def test_modes_preserve_nested_edges_and_source_clock(self):
         source = nested(child_end=20)
@@ -229,6 +282,31 @@ class ArrivalTests(unittest.TestCase):
         # at n=100000 and distinguish a uniform/constant substitute.
         self.assertAlmostEqual(statistics.mean(gaps), .5, delta=.01)
         self.assertAlmostEqual(statistics.pvariance(gaps), .25, delta=.0125)
+
+    def test_until_keeps_every_node_that_can_start_in_time(self):
+        # LLM calls at 0, 5 (after a 3 s tool) and 100 (after a 93 s user gap).
+        source = session("s", [call(0, 2), call(5, 7, 1, "tool"), call(100, 102, 2)])
+        row, _ = fi.native(source, 0, 0)
+        cut, kept = fi.truncate(row, 4)
+        llms = [i for i, n in enumerate(row["sub_requests"]) if n["kind"] == "llm"]
+        self.assertEqual([i in kept for i in llms], [True, True, False])
+        self.assertEqual(cut["initial"], [0])
+        for node in cut["sub_requests"]:
+            self.assertTrue(all(child < len(cut["sub_requests"]) for child in node["next"]))
+        self.assertEqual(fi.truncate(row, 1000)[0], row)
+
+    def test_until_bounds_arrivals_and_copies_get_their_own_identity(self):
+        sessions = [{}] * 50
+        bounded = fi.arrivals(sessions, "poisson", 2, 7, until=10)
+        self.assertTrue(bounded and bounded[-1] < 10)
+        self.assertEqual(bounded[:5], fi.arrivals(sessions[:5], "poisson", 2, 7))
+        self.assertEqual(fi.arrivals(sessions, "regular", 2, 0, until=2), [0, .5, 1, 1.5])
+        options = dict(token_mode="proxy-prefix", target_model="t", kv_layout="l", sharing_scope="pool")
+        first, _ = fi.native(with_deltas(session("s", [call(0, 2)])), 0, 0, **options)
+        again, _ = fi.native(with_deltas(session("s", [call(0, 2)])), 1, 0, copy=1, **options)
+        llm = lambda row: next(n for n in row["sub_requests"] if n["kind"] == "llm")
+        self.assertNotEqual(llm(first)["kv_prefix"]["namespace"], llm(again)["kv_prefix"]["namespace"])
+        self.assertNotEqual(llm(first)["session_id"], llm(again)["session_id"])
 
     def test_invalid_rate(self):
         for rate in (None, 0, -1, math.nan, math.inf):
@@ -324,6 +402,28 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(rows[1]["sub_requests"][1]["input_tokens"], 64)
             self.assertEqual(manifest["selected"][0]["source"]["line"], 2)
 
+    def test_selection_seed_shuffles_and_until_replays_as_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.create_source(root / "raw", [session(f"s{i}", [call(i, i + 1)]) for i in range(3)])
+            fi.index(argparse.Namespace(source=root / "raw", out=root / "index"))
+            orders = []
+            for seed in (1, 1, 2):
+                args = argparse.Namespace(index=root / "index", out=root / f"g{len(orders)}",
+                        arrivals="regular", sessions_per_second=1, seed=0, invalid="error",
+                        limit=None, max_calls=None, max_input_tokens=None, max_output_tokens=None,
+                        session_ids=None, selection_seed=seed, until=4.5)
+                fi.generate(args)
+                manifest = json.loads((args.out / "manifest.json").read_text())
+                orders.append([(s["session_id"], s["copy"]) for s in manifest["selected"]])
+            self.assertEqual(manifest["sessions"], 5)
+            self.assertEqual(manifest["copies"], 2)
+            self.assertEqual(manifest["offered_llm_calls_per_minute"], [5])
+            self.assertEqual(orders[0], orders[1])
+            self.assertEqual([s for s, c in orders[0][3:]], [s for s, c in orders[0][:2]])
+            self.assertEqual([c for _, c in orders[0]], [0, 0, 0, 1, 1])
+            self.assertEqual(sorted(s for s, c in orders[2] if c == 0), ["s0", "s1", "s2"])
+
     def test_corrupt_cached_download_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trace"
@@ -331,7 +431,7 @@ class SourceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cached hash"):
                 fi.download("unused", path, expected_sha="bad")
 
-    def test_proxy_recovers_selected_original_blocks_once_and_keeps_arrival_order(self):
+    def test_proxy_reads_index_deltas_not_the_source_and_keeps_arrival_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             late = session("late", [call(100, 102)])
@@ -345,7 +445,7 @@ class SourceTests(unittest.TestCase):
                     token_mode="proxy-prefix", target_model="target", kv_layout="layout", sharing_scope="shared")
             with patch.object(fi.zstd, "open", wraps=fi.zstd.open) as opened:
                 fi.generate(args)
-            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(opened.call_count, 0)
             rows = [json.loads(line) for line in (args.out / "workload.jsonl").read_text().splitlines()]
             self.assertEqual([r["arrival_time"] for r in rows], [0, .5])
             self.assertEqual(rows[1]["sub_requests"][1]["kv_prefix"]["block_ids"], [2**64 - 1])
@@ -360,18 +460,19 @@ class SourceTests(unittest.TestCase):
             manifest = json.loads((args.out / "manifest.json").read_text())
             self.assertEqual([s["session_id"] for s in manifest["selected"]], ["late"])
 
-    def test_proxy_rejects_changed_original_source(self):
+    def test_proxy_rejects_changed_block_deltas(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.create_source(root / "raw", [nested()])
             fi.index(argparse.Namespace(source=root / "raw", out=root / "index"))
-            metadata = json.loads((root / "index/index.json").read_text())
-            source = json.loads((root / "index/sessions.jsonl").read_text())
-            selection = {key: source[key] for key in ("source", "week", "session_id", "start_ms")}
-            (root / "raw" / source["source"]["file"]).write_bytes(b"changed")
-            with tempfile.TemporaryFile() as spool, self.assertRaisesRegex(ValueError, "compressed source changed"):
-                fi.recover_blocks(metadata, [selection], spool)
-
+            deltas = root / "index/blocks.jsonl"
+            deltas.write_text(deltas.read_text().replace("7", "6"))
+            args = argparse.Namespace(index=root / "index", out=root / "proxy", arrivals="regular",
+                    sessions_per_second=2, seed=0, invalid="error", limit=None, max_calls=None,
+                    max_input_tokens=None, max_output_tokens=None, session_ids=None,
+                    token_mode="proxy-prefix", target_model="target", kv_layout="layout", sharing_scope="shared")
+            with self.assertRaisesRegex(ValueError, "block deltas"):
+                fi.generate(args)
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,9 +62,11 @@ An iteration whose requests all compute one token uses decode (requests, Σ kv).
 Any other batch uses prefill (Σ q, Σ q·(q/2 + kv)); measured rows project to the
 same coordinates. One axis carries token-wise work and the other causal
 attention, so unequal lengths, more requests than measured and decode tokens in
-mixed batches need no separate rule. Lookups interpolate linearly, clamp below
-and extrapolate above without decreasing cost; extrapolated and mixed lookups are
-counted. `compute_speedup` divides every lookup for a declared projection to an
+mixed batches need no separate rule. Lookups interpolate linearly and clamp
+below. Above a curve's last sample they continue at the least-squares slope of
+its upper half (at least the last two samples), never negative: adjacent samples
+from different batch compositions sit at nearly equal coordinates, so their
+slope is noise. Extrapolated and mixed lookups are counted. `compute_speedup` divides every lookup for a declared projection to an
 unmeasured platform; it is a hypothesis, never fitted to serving results, and is
 reported in observations. Tables measured by a serving engine include its graphs, fusion and
 collectives, but not idle time or KV transfers.
@@ -80,8 +82,12 @@ collectives, but not idle time or KV transfers.
   links saturate in order of their per-weight share, fixing their flows, and
   capacity a flow cannot use because of another bottleneck goes to the rest.
 - The simulator keeps its own clock, advanced on every poll, and answers each
-  pending poll with the delay to its next flow event. This revisits rates when
-  another flow releases bandwidth.
+  pending poll with the delay to that transfer's next flow event: a flow
+  ending transmission, which changes rates, or arriving. When rates change,
+  transfers whose next event moved earlier are polled earlier; a delayed one
+  is polled early and answers again, so completions are exact without polling
+  every transfer at every event. A new transfer's first poll is deferred, so
+  transfers starting together share one rate computation.
 - Every owner has its own instance, so flows of different owners never contend.
 
 The opt-in CXL topology compiles physical ports and directional service edges

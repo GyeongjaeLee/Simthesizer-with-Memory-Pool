@@ -87,6 +87,71 @@ fn bytes(state: &Value, kind: &str) -> u64 {
         .sum()
 }
 #[test]
+fn ttft_parts_split_the_first_token_latency() {
+    let (results, _, _) = run(
+        config((0..8).map(|i| format!("D{i}")).collect(), true),
+        workload(1.0),
+    );
+    let row = serde_json::to_value(results.iter().find(|r| r.request_id == 0).unwrap()).unwrap();
+    for (index, reloads) in [(0, false), (2, true)] {
+        let call = &row["sub_requests"][index];
+        let parts = &call["ttft_parts"];
+        let sum: f64 = ["kv_load", "admission", "queue", "prefill"]
+            .iter()
+            .map(|k| parts[k].as_f64().unwrap())
+            .sum();
+        close(sum, call["token_latency"][0].as_f64().unwrap());
+        assert_eq!(parts["kv_load"].as_f64().unwrap() > 0.0, reloads);
+        assert!(parts["prefill"].as_f64().unwrap() > 0.0);
+        assert_eq!(call["reused_tokens"], if reloads { 16 } else { 0 });
+    }
+}
+
+#[test]
+fn first_token_waits_sum_the_non_prefill_ttft_parts() {
+    let mut system: Box<dyn System> =
+        serde_json::from_value(config((0..8).map(|i| format!("D{i}")).collect(), true)).unwrap();
+    system.init().unwrap();
+    let mut graph = Graph::new();
+    for request in workload(1.0) {
+        system
+            .add_request_arrival(request, &mut graph, None, None)
+            .unwrap();
+    }
+    let mut waits = None;
+    let results = Engine::new(graph, system)
+        .run_with_observer(|_, system| {
+            waits = system.first_token_waits();
+            Ok(())
+        })
+        .unwrap();
+    let parts: Vec<Value> = results
+        .iter()
+        .flat_map(|r| {
+            serde_json::to_value(r).unwrap()["sub_requests"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .filter_map(|call| call.get("ttft_parts").cloned())
+        .collect();
+    let (calls, total) = waits.unwrap();
+    assert_eq!(calls, parts.len() as u64);
+    close(
+        total,
+        parts
+            .iter()
+            .map(|p| {
+                ["kv_load", "admission", "queue"]
+                    .iter()
+                    .map(|k| p[k].as_f64().unwrap())
+                    .sum::<f64>()
+            })
+            .sum(),
+    );
+}
+
+#[test]
 fn spill_publishes_inside_tool_then_reload_gates_native_llm() {
     take_compute_calls();
     let (results, state, snapshots) = run(
@@ -283,7 +348,7 @@ fn background_reads_contend_only_when_physical_ingress_overlaps() {
     close(waits[2], waits[0]);
 }
 #[test]
-fn another_request_copies_resident_blocks_without_invalidating_active_owner() {
+fn another_request_reloads_the_offload_copy_not_a_peer_gpu() {
     let mut c = config(vec!["D0".into()], false);
     c["calls"]
         .as_array_mut()
@@ -292,8 +357,11 @@ fn another_request_copies_resident_blocks_without_invalidating_active_owner() {
     let mut requests = workload(0.0);
     requests.push(serde_json::from_value(json!({"request_id":2,"arrival_time":1.5,"initial":[0],"sub_requests":[{"kind":"llm","input_tokens":17,"output_tokens":1,"next":[]}]})).unwrap());
     let (_, state, _) = run(c, requests);
+    // Worker 1 reads node0's seeded copy over RDMA; worker 0 then reads the
+    // same copy locally while worker 1 still holds the blocks in HBM.
     assert_eq!(bytes(&state, "rdma_read"), 1024);
-    assert_eq!(bytes(&state, "hbm_read"), 1024);
+    assert_eq!(bytes(&state, "host_read"), 1024);
+    assert_eq!(bytes(&state, "hbm_read"), 0);
     let events = state["events"].as_array().unwrap();
     let first_complete = events
         .iter()
@@ -305,7 +373,7 @@ fn another_request_copies_resident_blocks_without_invalidating_active_owner() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| t["kind"] == "hbm_read")
+        .filter(|t| t["kind"] == "host_read")
         .all(|t| t["start"].as_f64().unwrap() < first_complete));
     assert!(state["blocks"]
         .as_array()
@@ -564,7 +632,7 @@ fn legacy_proxy_geometry_and_partial_scheduler_blocks() {
 }
 
 #[test]
-fn ep_rank_copy_preserves_live_source_on_the_same_worker() {
+fn ep_rank_reloads_the_offload_copy_not_its_neighbor_gpu() {
     let mut c = tp_config(2);
     c["pressures"] = json!([]);
     for worker in c["instances"].as_array_mut().unwrap() {
@@ -588,8 +656,9 @@ fn ep_rank_copy_preserves_live_source_on_the_same_worker() {
     );
     let (results, state, snapshots) = run(c, requests);
     assert_eq!(results.len(), 3);
-    assert_eq!(bytes(&state, "rdma_read"), 1024);
-    assert_eq!(bytes(&state, "hbm_read"), 1024);
+    // Both reloads read node0's copy; rank 0's HBM copy on the same worker is no source.
+    assert_eq!(bytes(&state, "rdma_read"), 2048);
+    assert_eq!(bytes(&state, "hbm_read"), 0);
     let events = state["events"].as_array().unwrap();
     let first_complete = events
         .iter()
@@ -602,14 +671,17 @@ fn ep_rank_copy_preserves_live_source_on_the_same_worker() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| t["kind"] == "hbm_read")
+        .filter(|t| t["kind"] == "rdma_read" && t["dst_owner"] == json!([1, 1]))
         .collect::<Vec<_>>();
+    assert_eq!(moved.len(), 16);
+    // The call arrives at 2.5 and, as in vLLM, looks up its prefix at its
+    // worker's next scheduling step, when the running wave ends.
+    let load_start = moved[0]["start"].as_f64().unwrap();
+    assert!(load_start > 2.5);
+    close(load_start, first_complete);
     assert!(moved
         .iter()
-        .all(|t| t["src_owner"] == json!([1, 0]) && t["dst_owner"] == json!([1, 1])));
-    assert!(moved
-        .iter()
-        .all(|t| t["start"].as_f64().unwrap() < first_complete));
+        .all(|t| t["start"].as_f64().unwrap() == load_start));
     let ready = events
         .iter()
         .find(|e| e["event"] == "kv_ready" && e["request_id"] == 2)
@@ -622,20 +694,22 @@ fn ep_rank_copy_preserves_live_source_on_the_same_worker() {
             .map(|t| t["completion"].as_f64().unwrap())
             .fold(0.0, f64::max),
     );
-    assert!(snapshots.iter().any(|s| s["time"] == 2.5
-        && s["state"]["cxl_pool"]["blocks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|b| b["location"]["worker"] == 1
-                && b["location"]["rank"] == 0
-                && !b["pins"].as_array().unwrap().is_empty()
-                && (b["pending"]["rank"] == 1
-                    || b["replicas"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|p| p["rank"] == 1)))));
+    assert!(snapshots
+        .iter()
+        .any(|s| s["time"].as_f64() == Some(load_start)
+            && s["state"]["cxl_pool"]["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["location"]["worker"] == 1
+                    && b["location"]["rank"] == 0
+                    && !b["pins"].as_array().unwrap().is_empty()
+                    && (b["pending"]["rank"] == 1
+                        || b["replicas"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|p| p["rank"] == 1)))));
     assert!(state["blocks"]
         .as_array()
         .unwrap()
@@ -678,11 +752,81 @@ fn routing_spreads_concurrent_calls_or_pins_sessions() {
     let (_, _, snapshots) = run(c.clone(), vec![call(0, "a", 0.0), call(1, "b", 0.0)]);
     assert_eq!(tokens(&snapshots.last().unwrap()["state"]), [2, 2]);
     // Session hash: every call of one session reaches the same worker.
-    c["routing"] = json!("session_hash");
+    c["routing"] = json!("session");
     let (_, _, snapshots) = run(c, (0..4).map(|id| call(id, "s", id as f64)).collect());
     let mut counts = tokens(&snapshots.last().unwrap()["state"]);
     counts.sort();
     assert_eq!(counts, [0, 8]);
+}
+
+#[test]
+fn cache_affinity_follows_the_host_holding_the_prefix() {
+    let tokens = |state: &Value| -> Vec<u64> {
+        let mut counts: Vec<u64> = state["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["scheduler"]["generation_tokens_total"].as_u64().unwrap())
+            .collect();
+        counts.sort();
+        counts
+    };
+    let prefix = json!({"namespace":"shared:model:layout","block_tokens":1,"block_ids":[1,2,3,4]});
+    let call = |id: u64, session: &str, arrival: f64| -> Request {
+        serde_json::from_value(json!({"request_id":id,"arrival_time":arrival,"initial":[0],
+            "sub_requests":[{"kind":"llm","input_tokens":5,"output_tokens":2,"session_id":session,
+                "kv_prefix":prefix,"next":[]}]}))
+        .unwrap()
+    };
+    let mut c = native_config(1, 4096);
+    let worker = c["instances"][0].clone();
+    c["instances"].as_array_mut().unwrap().push(worker);
+    let requests = || vec![call(0, "a", 0.0), call(1, "c", 5.0)];
+    // Session routing splits the two sessions; cache_affinity follows the host
+    // that stored the first session's prefix.
+    c["routing"] = json!("session");
+    let (_, _, snapshots) = run(c.clone(), requests());
+    assert_eq!(tokens(&snapshots.last().unwrap()["state"]), [2, 2]);
+    c["routing"] = json!("cache_affinity");
+    let (_, state, snapshots) = run(c, requests());
+    assert_eq!(tokens(&snapshots.last().unwrap()["state"]), [0, 4]);
+    // The second call hits the first call's HBM copy: nothing is reloaded.
+    assert_eq!(bytes(&state, "host_read") + bytes(&state, "rdma_read"), 0);
+}
+
+#[test]
+fn cache_affinity_credits_each_host_up_to_its_last_block_in_the_prefix() {
+    let call = |id: u64, blocks: &[u64], output: u32, arrival: f64| -> Request {
+        serde_json::from_value(json!({"request_id":id,"arrival_time":arrival,"initial":[0],
+            "sub_requests":[{"kind":"llm","input_tokens":blocks.len() + 1,"output_tokens":output,
+                "session_id":id.to_string(),"next":[],
+                "kv_prefix":{"namespace":"shared:model:layout","block_tokens":1,"block_ids":blocks}}]}))
+        .unwrap()
+    };
+    let mut c = native_config(1, 4096);
+    let worker = c["instances"][0].clone();
+    c["instances"].as_array_mut().unwrap().push(worker);
+    c["routing"] = json!("cache_affinity");
+    // Blocks 1-2 land in one host. Its worker is still decoding when the
+    // second call arrives, so load sends that call to the other worker, which
+    // stores blocks 3-4. LMCache credits that host with the whole run 1-4.
+    let (_, state, snapshots) = run(
+        c,
+        vec![
+            call(0, &[1, 2], 5, 0.0),
+            call(1, &[1, 2, 3, 4], 2, 2.0),
+            call(2, &[1, 2, 3, 4], 2, 10.0),
+        ],
+    );
+    assert_eq!(bytes(&state, "rdma_read"), 2 * 64);
+    let mut counts: Vec<u64> = snapshots.last().unwrap()["state"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["scheduler"]["generation_tokens_total"].as_u64().unwrap())
+        .collect();
+    counts.sort();
+    assert_eq!(counts, [4, 5]);
 }
 
 #[test]
@@ -782,6 +926,35 @@ fn host_and_cxl_pressure_reclaim_only_copies_and_respect_capacities() {
     }
 }
 
+#[test]
+fn without_pool_devices_host_dram_evicts_least_recent_blocks() {
+    let mut c = native_config(2, 128);
+    c["instances"][0]["scheduler"]["max_num_batched_tokens"] = json!(2);
+    c["placement_devices"] = json!([]);
+    let request = serde_json::from_value(json!({"request_id":0,"arrival_time":0.0,"initial":[0],"sub_requests":[{"kind":"llm","input_tokens":6,"output_tokens":1,"next":[]}]})).unwrap();
+    let (_, state, snapshots) = run(c, vec![request]);
+    assert_eq!(bytes(&state, "store"), 384);
+    assert_eq!(bytes(&state, "spill"), 0);
+    let reclaimed = state["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "cache_reclaimed")
+        .collect::<Vec<_>>();
+    assert_eq!(reclaimed.len(), 2);
+    assert!(reclaimed
+        .iter()
+        .all(|event| event["location"]["tier"] == "host"));
+    for snapshot in snapshots {
+        assert!(
+            snapshot["state"]["cxl_pool"]["hosts"][0]["block_bytes"]
+                .as_u64()
+                .unwrap()
+                <= 128
+        );
+    }
+}
+
 fn hbm_capacity(c: &mut Value, tokens: u64) {
     let mut model: Box<dyn simthesizer_core::Model> =
         serde_json::from_value(c["instances"][0]["model"].clone()).unwrap();
@@ -807,7 +980,7 @@ fn hbm_pressure_preserves_backing_and_reloads_without_duplicate_store() {
         serde_json::from_value(json!({"request_id":id,"arrival_time":(id * 3) as f64,"initial":[0],"sub_requests":[sub]})).unwrap()
     }).collect();
     let (_, state, _) = run(c, requests);
-    assert_eq!(bytes(&state, "rdma_read"), 4 * 64);
+    assert_eq!(bytes(&state, "host_read"), 4 * 64);
     assert_eq!(bytes(&state, "store"), 11 * 64);
     assert!(state["events"]
         .as_array()
@@ -890,7 +1063,7 @@ fn pending_store_protects_hbm_until_the_copy_is_published() {
         }
     }
     let requests = (0..2).map(|id| serde_json::from_value(json!({"request_id":id,"arrival_time":id as f64 * 1.1,"initial":[0],"sub_requests":[{"kind":"llm","input_tokens":4,"output_tokens":1,"next":[]}]})).unwrap()).collect();
-    let (_, state, snapshots) = run(c, requests);
+    let (results, state, snapshots) = run(c, requests);
     let first_store_end = state["transfers"]
         .as_array()
         .unwrap()
@@ -905,11 +1078,14 @@ fn pending_store_protects_hbm_until_the_copy_is_published() {
         .map(|transfer| transfer["completion"].as_f64().unwrap())
         .fold(0.0, f64::max);
     assert!(first_store_end > 1.1);
-    assert!(state["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|event| event["event"] == "hbm_admission_wait"));
+    // The second call waits for HBM before its first token.
+    let second = serde_json::to_value(results.iter().find(|r| r.request_id == 1).unwrap()).unwrap();
+    assert!(
+        second["sub_requests"][0]["ttft_parts"]["admission"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
     assert!(snapshots
         .iter()
         .any(|snapshot| snapshot["time"].as_f64().unwrap() >= 1.1
@@ -1053,13 +1229,13 @@ fn hybrid_reload_transfers_state_and_attention_and_retains_backing() {
             recurrent_request(2, 1, true),
         ],
     );
-    assert_eq!(bytes(&state, "rdma_read"), 2 * 32 + 152);
+    assert_eq!(bytes(&state, "host_read"), 2 * 32 + 152);
     let reads = state["transfers"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|transfer| {
-            transfer["kind"] == "rdma_read"
+            transfer["kind"] == "host_read"
                 && transfer["block"]
                     .as_str()
                     .unwrap()
@@ -1303,13 +1479,15 @@ fn hybrid_preemption_drains_state_and_transfer_reservations() {
         .unwrap()["time"]
         .as_f64()
         .unwrap();
+    // HBM cannot hold both calls: as in vLLM, the preempted call waits until
+    // the other frees its KV, then reloads its surviving prefix.
     assert!(state["events"]
         .as_array()
         .unwrap()
         .iter()
         .any(|event| event["event"] == "request_resumed"
             && event["request_id"] == 1
-            && event["time"].as_f64().unwrap() < first_completion));
+            && event["time"].as_f64().unwrap() >= first_completion));
     assert_eq!(state["unfinished_transfers"], 0);
     assert!(state["blocks"]
         .as_array()
@@ -1323,4 +1501,347 @@ fn hybrid_preemption_drains_state_and_transfer_reservations() {
             .as_u64()
             .unwrap()
             <= 640));
+}
+
+#[test]
+fn waiting_calls_cannot_fill_hbm_with_prefixes_that_starve_admission() {
+    // Seeding calls leave three 6-block prefixes in host DRAM. Three calls
+    // then arrive at once, each restoring one and adding 3 tokens. HBM holds
+    // 14 tokens: loading two prefixes would leave neither call room to start.
+    let keys = |r: u64| {
+        (0..6)
+            .map(|b| format!("fixture:R{r}B{b}"))
+            .collect::<Vec<_>>()
+    };
+    let mut c = native_config(1, 4096);
+    let mut calls: Vec<Value> = (0..3)
+        .map(|r| json!({"request_id":r,"subrequest_index":0,"worker":0,"blocks":keys(r)}))
+        .collect();
+    calls.extend((0..3).map(
+        |r| json!({"request_id":r + 3,"subrequest_index":0,"worker":0,"seed_host_blocks":keys(r)}),
+    ));
+    c["calls"] = json!(calls);
+    hbm_capacity(&mut c, 14);
+    let call = |r: u64, arrival: f64, input: u32| -> Request {
+        serde_json::from_value(json!({"request_id":r,"arrival_time":arrival,"initial":[0],
+            "sub_requests":[{"kind":"llm","input_tokens":input,"output_tokens":1,"next":[]}]}))
+        .unwrap()
+    };
+    let mut requests: Vec<Request> = (0..3).map(|r| call(r, 50.0, 9)).collect();
+    requests.extend((3..6).map(|r| call(r, 0.0, 7)));
+    let (results, state, _) = run(c, requests);
+    assert_eq!(results.len(), 6);
+    assert_eq!(bytes(&state, "host_read"), 18 * 64);
+}
+
+/// A 192-token prefill takes the whole 64-token budget for three steps while
+/// two calls arrive needing host prefixes. Returns each call's load issue
+/// time and the prefill's completion.
+fn loads_under_a_full_budget(limit: Option<u64>) -> ([f64; 2], f64) {
+    let keys = |call: u64| {
+        (0..6)
+            .map(|b| format!("fixture:C{call}B{b}"))
+            .collect::<Vec<_>>()
+    };
+    let mut c = native_config(1, 1 << 16);
+    c["instances"][0]["scheduler"]["max_batch"] = json!(4);
+    if let Some(limit) = limit {
+        c["instances"][0]["scheduler"]["max_num_inflight_kv_loads"] = json!(limit);
+    }
+    c["calls"] = json!([
+        {"request_id":0,"subrequest_index":0,"worker":0,"seed_host_blocks":keys(2)},
+        {"request_id":1,"subrequest_index":0,"worker":0,"seed_host_blocks":keys(3)},
+        {"request_id":2,"subrequest_index":0,"worker":0,"blocks":keys(2)},
+        {"request_id":3,"subrequest_index":0,"worker":0,"blocks":keys(3)},
+    ]);
+    let call = |r: u64, arrival: f64, input: u32| -> Request {
+        serde_json::from_value(json!({"request_id":r,"arrival_time":arrival,"initial":[0],
+            "sub_requests":[{"kind":"llm","input_tokens":input,"output_tokens":1,"next":[]}]}))
+        .unwrap()
+    };
+    let requests = vec![
+        call(0, 0.0, 7),
+        call(1, 0.0, 7),
+        call(4, 20.0, 192),
+        call(2, 20.5, 9),
+        call(3, 20.5, 9),
+    ];
+    let (results, state, _) = run(c, requests);
+    assert_eq!(results.len(), 5);
+    let issue = |call: u64| {
+        let issues: Vec<f64> = state["transfers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["kind"] == "host_read")
+            .filter(|t| t["block"].as_str().unwrap().contains(&format!("C{call}B")))
+            .map(|t| t["issue"].as_f64().unwrap())
+            .collect();
+        assert_eq!(issues.len(), 6);
+        issues[0]
+    };
+    let prefill =
+        serde_json::to_value(results.iter().find(|r| r.request_id == 4).unwrap()).unwrap();
+    let first_token = prefill["arrival_time"].as_f64().unwrap()
+        + prefill["sub_requests"][0]["token_latency"][0]
+            .as_f64()
+            .unwrap();
+    ([issue(2), issue(3)], first_token)
+}
+
+#[test]
+fn loads_wait_for_a_slot_and_budget_unless_inflight_loads_are_allowed() {
+    // vLLM default: no lookup while the running prefill takes the budget.
+    let ([first, second], prefill) = loads_under_a_full_budget(None);
+    close(first, prefill);
+    close(second, prefill);
+    // With a limit, loads start anyway, one in flight at a time; a loaded
+    // request admitted at a step frees its place for the next lookup.
+    let ([first, second], prefill) = loads_under_a_full_budget(Some(1));
+    assert!(first > 20.5 && first < prefill);
+    close(second, prefill);
+    let ([first, second], _) = loads_under_a_full_budget(Some(2));
+    close(first, second);
+    assert!(first < prefill);
+}
+
+fn call(id: u64, arrival: f64, input: u32, output: u32) -> Request {
+    serde_json::from_value(json!({"request_id":id,"arrival_time":arrival,"initial":[0],
+        "sub_requests":[{"kind":"llm","input_tokens":input,"output_tokens":output,"next":[]}]}))
+    .unwrap()
+}
+
+#[test]
+fn a_consumer_pins_only_its_own_hbm_copy() {
+    // Worker 0 computes four blocks and keeps idle HBM copies. Worker 1
+    // reloads them from host DRAM over [2, 2.000256) and decodes until about
+    // 10 s. A third call needs worker 0's HBM during and after that reload.
+    for arrival in [2.0001, 4.0] {
+        let mut c = config(vec![], false);
+        hbm_capacity(&mut c, 5);
+        c["calls"] = json!([
+            {"request_id":0,"subrequest_index":0,"worker":0,"completed_blocks":keys(4)},
+            {"request_id":1,"subrequest_index":0,"worker":1,"blocks":keys(4),"completed_blocks":keys(4)},
+            {"request_id":2,"subrequest_index":0,"worker":0},
+        ]);
+        let (results, state, _) = run(
+            c,
+            vec![
+                call(0, 0.0, 5, 1),
+                call(1, 2.0, 5, 8),
+                call(2, arrival, 5, 1),
+            ],
+        );
+        assert_eq!(results.len(), 3);
+        assert_eq!(bytes(&state, "rdma_read"), 4 * 64);
+        assert!(state["events"].as_array().unwrap().iter().any(|event| {
+            event["event"] == "cache_reclaimed"
+                && event["location"]["tier"] == "hbm"
+                && event["location"]["worker"] == 0
+                && event["time"] == arrival
+        }));
+    }
+}
+
+#[test]
+fn token_traces_identify_reusable_kv() {
+    take_compute_calls();
+    let traced = |id: u64, input: Vec<u32>, output: Vec<u32>| -> Request {
+        let mut sub = json!({"kind":"llm","input_tokens":input.len(),"output_tokens":output.len().max(1),
+            "input_token_ids":input,"next":[]});
+        if !output.is_empty() {
+            sub["output_token_ids"] = json!(output);
+        }
+        serde_json::from_value(json!({"request_id":id,"arrival_time":(id * 10) as f64,
+            "initial":[0],"sub_requests":[sub]}))
+        .unwrap()
+    };
+    // An equal prompt reuses all but its logits token, a traced output extends
+    // the identity, and a different first token misses.
+    let (results, _, _) = run(
+        native_config(1, 4096),
+        vec![
+            traced(0, vec![1, 2, 3, 4, 5], vec![6, 7]),
+            traced(1, vec![1, 2, 3, 4, 5], vec![]),
+            traced(2, vec![1, 2, 3, 4, 5, 6, 7], vec![]),
+            traced(3, vec![9, 2, 3, 4, 5], vec![]),
+        ],
+    );
+    assert_eq!(
+        take_compute_calls()
+            .iter()
+            .filter(|c| c.layer.name() == "attention")
+            .map(|c| c.batch[0].q_len)
+            .collect::<Vec<_>>(),
+        vec![5, 1, 1, 1, 5]
+    );
+    let reused = (0..4)
+        .map(|id| {
+            let row = serde_json::to_value(results.iter().find(|r| r.request_id == id).unwrap());
+            row.unwrap()["sub_requests"][0]["reused_tokens"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reused, [0, 4, 6, 0]);
+}
+
+#[test]
+fn resumed_calls_need_room_for_their_generated_tokens() {
+    // A (2 prompt, 8 output tokens) publishes nothing. B's 4-block prefix
+    // loads beside it and preempts it after five tokens: A resumes needing
+    // its 7 known tokens, not its 2 prompt tokens, so it waits for B.
+    for limit in [1, 2] {
+        let mut c = native_config(1, 4096);
+        c["instances"][0]["scheduler"]["max_num_inflight_kv_loads"] = json!(limit);
+        hbm_capacity(&mut c, 10);
+        c["calls"] = json!([
+            {"request_id":0,"subrequest_index":0,"worker":0,"seed_host_blocks":keys(4)},
+            {"request_id":1,"subrequest_index":0,"worker":0},
+            {"request_id":2,"subrequest_index":0,"worker":0,"blocks":keys(4)},
+        ]);
+        let (results, state, _) = run(
+            c,
+            vec![call(0, 0.0, 5, 1), call(1, 10.0, 2, 8), call(2, 10.0, 5, 1)],
+        );
+        assert_eq!(results.len(), 3);
+        let events = state["events"].as_array().unwrap();
+        assert!(events.iter().any(|e| e["event"] == "request_preempted"));
+        let resumed = events
+            .iter()
+            .find(|e| e["event"] == "request_resumed")
+            .unwrap();
+        let b_done = results.iter().find(|r| r.request_id == 2).unwrap();
+        let ResultSubRequest::Llm { token_latency, .. } = &b_done.sub_requests[0] else {
+            unreachable!()
+        };
+        assert!(resumed["time"].as_f64().unwrap() >= 10.0 + token_latency[0]);
+    }
+}
+
+/// Request-seconds of each wait gauge, holding each snapshot until the next as
+/// `scripts/kv_metrics.py` does, summed anywhere in the state and over worker
+/// schedulers only.
+fn gauge_seconds(snapshots: &[Value]) -> ([f64; 3], [f64; 3]) {
+    const GAUGES: [&str; 3] = [
+        "kv_preparation_waiting_requests",
+        "hbm_admission_waiting_requests",
+        "scheduler_waiting_requests",
+    ];
+    fn add(value: &Value, weight: f64, totals: &mut [f64; 3]) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    match GAUGES.iter().position(|name| name == key) {
+                        Some(index) => totals[index] += child.as_u64().unwrap() as f64 * weight,
+                        None => add(child, weight, totals),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| add(item, weight, totals)),
+            _ => {}
+        }
+    }
+    let (mut anywhere, mut workers) = ([0.0; 3], [0.0; 3]);
+    for pair in snapshots.windows(2) {
+        let weight = pair[1]["time"].as_f64().unwrap() - pair[0]["time"].as_f64().unwrap();
+        add(&pair[0]["state"], weight, &mut anywhere);
+        for worker in pair[0]["state"]["instances"].as_array().unwrap() {
+            add(&worker["scheduler"], weight, &mut workers);
+        }
+    }
+    (anywhere, workers)
+}
+
+fn ttft_seconds(results: &[RequestResult], part: &str) -> f64 {
+    results
+        .iter()
+        .flat_map(|r| {
+            serde_json::to_value(r).unwrap()["sub_requests"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .filter_map(|call| call["ttft_parts"][part].as_f64())
+        .sum()
+}
+
+#[test]
+fn wait_gauges_count_each_call_once() {
+    // A reload, then calls whose prefixes wait for HBM behind loaded ones.
+    let mut admission = native_config(1, 4096);
+    let keys = |r: u64| {
+        (0..6)
+            .map(|b| format!("fixture:R{r}B{b}"))
+            .collect::<Vec<_>>()
+    };
+    let mut calls: Vec<Value> = (0..3)
+        .map(|r| json!({"request_id":r,"subrequest_index":0,"worker":0,"blocks":keys(r)}))
+        .collect();
+    calls.extend((0..3).map(
+        |r| json!({"request_id":r + 3,"subrequest_index":0,"worker":0,"seed_host_blocks":keys(r)}),
+    ));
+    admission["calls"] = json!(calls);
+    hbm_capacity(&mut admission, 14);
+    let mut requests: Vec<Request> = (0..3).map(|r| call(r, 50.0, 9, 1)).collect();
+    requests.extend((3..6).map(|r| call(r, 0.0, 7, 1)));
+    for (config, requests) in [
+        (
+            config((0..8).map(|i| format!("D{i}")).collect(), true),
+            workload(1.0),
+        ),
+        (admission, requests),
+    ] {
+        let (results, _, snapshots) = run(config, requests);
+        let (anywhere, workers) = gauge_seconds(&snapshots);
+        // Worker schedulers own every enqueued call's phase.
+        assert_eq!(anywhere, workers);
+        let [preparation, admission, _] = workers;
+        close(preparation, ttft_seconds(&results, "kv_load"));
+        // The gauge also counts calls queued behind an HBM wait.
+        assert!(admission >= ttft_seconds(&results, "admission") - 1e-9);
+    }
+}
+
+#[test]
+fn incremental_prefix_identity_reuses_like_the_full_list_in_the_pool() {
+    let session = |incremental: bool| -> Request {
+        let second = if incremental {
+            json!({"namespace":"n:s","block_tokens":1,"parent":0,"shared":4,"block_ids":[9]})
+        } else {
+            json!({"namespace":"n:s","block_tokens":1,"block_ids":[1,2,3,4,9]})
+        };
+        serde_json::from_value(
+            json!({"request_id":0,"arrival_time":0.0,"initial":[0],"sub_requests":[
+            {"kind":"llm","input_tokens":5,"output_tokens":2,"next":[1],
+             "kv_prefix":{"namespace":"n:s","block_tokens":1,"block_ids":[1,2,3,4]}},
+            {"kind":"tool_call","input_tokens":0,"output_tokens":0,"duration":1.0,"next":[2]},
+            {"kind":"llm","input_tokens":6,"output_tokens":1,"next":[],"kv_prefix":second}]}),
+        )
+        .unwrap()
+    };
+    let rows = |results: Vec<RequestResult>| {
+        results
+            .into_iter()
+            .map(|r| {
+                let mut row = serde_json::to_value(r).unwrap();
+                row["sub_requests"][2]["kv_prefix"] = Value::Null;
+                row
+            })
+            .collect::<Vec<_>>()
+    };
+    let (full, _, _) = run(native_config(1, 4096), vec![session(false)]);
+    let (relative, _, _) = run(native_config(1, 4096), vec![session(true)]);
+    let ResultSubRequest::Llm {
+        reused_tokens,
+        kv_prefix,
+        ..
+    } = &relative[0].sub_requests[2]
+    else {
+        unreachable!()
+    };
+    // The first call computed blocks 1-4; block 9 is new.
+    assert_eq!(*reused_tokens, Some(4));
+    assert_eq!(kv_prefix.as_ref().unwrap().parent, Some(0));
+    assert_eq!(rows(full), rows(relative));
 }

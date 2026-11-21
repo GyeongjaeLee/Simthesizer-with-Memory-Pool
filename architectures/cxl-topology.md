@@ -8,8 +8,8 @@ Physical links have a width and two independently configured directions.
 Each attached switch counts the width once, within its maximum 256 lanes.
 Adapters have one x16 port and a node identity; a node may have several.
 Memory devices have one x8 port, explicit capacity, and separate read/write
-service rates. Each worker/rank selects an ordered, nonempty adapter list on
-its node; several workers may share adapters. Physical ports count once,
+service rates. Each worker/rank selects an ordered adapter list on its node,
+nonempty whenever the topology has memory devices; several workers may share adapters. Physical ports count once,
 regardless of binding count. Duplicate ports, invalid bindings,
 missing routes and excess physical lanes fail initialization. Traffic
 oversubscription remains valid.
@@ -19,10 +19,14 @@ fixtures use DRAM→adapter for spill, adapter→GPU ingress for CXL reads, and
 DRAM→NIC→compute fabric→NIC→GPU ingress for remote DRAM. Shared ingress is
 an explicit edge; GPU destination identity imposes no implicit cap. Device
 payload endpoints have mandatory read/write service edges before their
-physical ports. Independent link directions and fabrics remain independent.
+physical ports; host DRAM endpoints may declare the same edges, so all host
+traffic shares one memory rate. Independent link directions and fabrics remain independent.
 
 Worker/rank bindings constrain spill through the source adapter, CXL reload
 through the destination adapter, and cross-node DRAM/HBM through both NICs.
+A route segment between two CXL endpoints (switches, adapters, memory devices)
+uses only links among them, so pool traffic never relays through another host's
+adapter and NIC.
 Each physical block transfer selects
 `adapters[(logical_block_index + rank) % adapters.len()]`; list order is
 authoritative. Immutable route handles refer to the same physical links, so
@@ -71,7 +75,7 @@ measured CXL latency fidelity. Counts and widths remain configuration data.
 Native `cxl_topology` tests cover lane ledgers, parallel links, endpoint limits,
 rank/adapter bindings and route isolation.
 [`experiments/cxl-pool/generate.py`](../experiments/cxl-pool/generate.py) emits
-single-switch, uniform and non-uniform pool scenarios.
+pool-free, single-switch, uniform and non-uniform scenarios.
 
 Parallel physical links between two switches form one flow trunk per direction
 with their summed rate, while lanes stay counted per port. Equal striping loads

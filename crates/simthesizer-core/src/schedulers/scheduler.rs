@@ -38,6 +38,26 @@ pub trait Scheduler: Module {
     fn external_kv_requirement(&self) -> Option<(u64, u64)> {
         None
     }
+    /// Prompt and generated tokens of a queued request: the KV it needs.
+    fn known_tokens(&self, _request_id: u64) -> Option<u32> {
+        None
+    }
+    /// Private bytes that admitting a request with `known_tokens` needs once
+    /// its first `restored_tokens` arrive as external KV.
+    fn external_admission_bytes(&self, _known_tokens: u32, _restored_tokens: u32) -> u64 {
+        0
+    }
+    /// Holds `bytes` out of the external KV budget until the request is
+    /// admitted, so external loads cannot strand the HBM its admission needs;
+    /// zero drops the hold.
+    fn reserve_external_admission(&mut self, _request_id: u64, _bytes: u64) {}
+    /// A pending request waits in the queue for its external prefix lookup,
+    /// which happens at its turn, as vLLM asks its KV connector on admission.
+    fn set_external_pending(&mut self, _request_id: u64, _pending: bool) {}
+    /// The pending request to look up next, if vLLM would at this step.
+    fn external_lookup(&self) -> Option<u64> {
+        None
+    }
     fn adopt_external_prefix(&mut self, _request_id: u64, _tokens: u32) -> Result<()> {
         anyhow::bail!("scheduler does not support external KV adoption")
     }
@@ -70,7 +90,8 @@ pub trait Scheduler: Module {
         Ok(())
     }
 
-    fn schedule(&mut self) -> Result<Vec<RequestState>>;
+    /// The next iteration's batch, starting at `now`.
+    fn schedule(&mut self, now: f64) -> Result<Vec<RequestState>>;
 
     fn enqueue_sub_request(&mut self, sub_request: ReadySubRequest);
 

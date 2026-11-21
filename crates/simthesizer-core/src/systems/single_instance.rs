@@ -13,7 +13,7 @@ use crate::scheduler::Scheduler;
 use crate::system::{pending_llm_load, System, SystemEvent};
 use crate::types::{
     InstanceLoad, NodeID, ReadySubRequest, Request, RequestResult, ResultSubRequest, SubRequest,
-    SubRequestCompletion,
+    SubRequestCompletion, TtftParts,
 };
 
 #[derive(Deserialize)]
@@ -39,6 +39,9 @@ pub struct SingleInstanceSystem {
 
     #[serde(skip_deserializing, default)]
     pending_completion_results: HashMap<NodeID, SubRequestCompletion>,
+
+    #[serde(skip_deserializing, default)]
+    first_token_waits: (u64, f64),
 }
 
 struct ActiveRequest {
@@ -178,6 +181,11 @@ impl SingleInstanceSystem {
                         session_id: sub_request.session_id().map(str::to_owned),
                         provider_tokens: sub_request.provider_tokens().cloned(),
                         kv_prefix: sub_request.kv_prefix().cloned(),
+                        ttft_parts: TtftParts::scheduled(
+                            completion.token_latency.first().copied(),
+                            completion.queue_wait,
+                        ),
+                        reused_tokens: None,
                     },
                     SubRequest::ToolCall {
                         input_tokens,
@@ -272,6 +280,7 @@ impl LogicalHandler for SingleInstanceSystem {
                                 subrequest_index,
                                 completion_node_id,
                                 token_latency: Vec::new(),
+                                queue_wait: None,
                             },
                         )?;
                         let run = graph.add_logical_node(
@@ -302,6 +311,10 @@ impl LogicalHandler for SingleInstanceSystem {
                     bail!("completion node {current} received mismatched completion payload");
                 }
 
+                if let Some(queue) = completion.queue_wait {
+                    self.first_token_waits.0 += 1;
+                    self.first_token_waits.1 += queue;
+                }
                 let active = self
                     .active_requests
                     .get_mut(&request_id)
@@ -363,7 +376,7 @@ impl LogicalHandler for SingleInstanceSystem {
                         output_token_ids.clone(),
                         known_tokens,
                         kv_tokens,
-                        sub_request.kv_prefix().cloned(),
+                        active.request.resolved_kv_prefix(subrequest_index),
                     )
                 };
                 self.scheduler.enqueue_sub_request(ReadySubRequest {
@@ -396,6 +409,15 @@ impl LogicalHandler for SingleInstanceSystem {
                     graph.add_edge(capacity, retry)?;
                     return Ok(0.0);
                 }
+                // A request at its turn first looks up its external prefix.
+                if let Some(request) = self.scheduler.external_lookup() {
+                    let sink = self.request_sinks[&request];
+                    let lookup = graph.add_logical_node(sink, SystemEvent::KvLookup { request });
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(current, lookup)?;
+                    graph.add_edge(lookup, retry)?;
+                    return Ok(0.0);
+                }
                 let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
                 let mut previous = current;
                 if let Some((request_id, required_bytes)) = self.scheduler.external_kv_requirement()
@@ -420,7 +442,7 @@ impl LogicalHandler for SingleInstanceSystem {
                 Ok(0.0)
             }
             LogicalPayload::LlmSchedule => {
-                let batch_requests = self.scheduler.schedule()?;
+                let batch_requests = self.scheduler.schedule(now)?;
                 let preemptions = self.scheduler.take_external_preemptions();
                 if !preemptions.is_empty() || self.scheduler.external_reclaim_pending() {
                     self.scheduler.cancel_iteration();
@@ -509,6 +531,9 @@ impl Module for SingleInstanceSystem {
 }
 
 impl System for SingleInstanceSystem {
+    fn first_token_waits(&self) -> Option<(u64, f64)> {
+        Some(self.first_token_waits)
+    }
     fn next_kv_capacity_event(&self, rank: usize) -> Option<NodeID> {
         (rank < self.model_runner.parallel_strategy().tp as usize)
             .then_some(self.kv_capacity_event)
@@ -542,6 +567,36 @@ impl System for SingleInstanceSystem {
     fn external_kv_requirement(&self, ranks: &[usize]) -> Option<(u64, u64)> {
         let _ = ranks;
         self.scheduler.external_kv_requirement()
+    }
+    fn known_tokens(&self, request_id: u64) -> Option<u32> {
+        self.scheduler.known_tokens(request_id)
+    }
+    fn external_admission_bytes(
+        &self,
+        _rank: usize,
+        known_tokens: u32,
+        restored_tokens: u32,
+    ) -> u64 {
+        self.scheduler
+            .external_admission_bytes(known_tokens, restored_tokens)
+    }
+    fn reserve_external_admission(
+        &mut self,
+        request_id: u64,
+        _rank: usize,
+        bytes: u64,
+    ) -> Result<()> {
+        self.scheduler.reserve_external_admission(request_id, bytes);
+        Ok(())
+    }
+    fn set_external_pending(&mut self, request_id: u64, pending: bool) -> Result<()> {
+        self.scheduler.set_external_pending(request_id, pending);
+        Ok(())
+    }
+    fn wake(&mut self, after: NodeID, graph: &mut Graph) -> Result<()> {
+        let module = self as *mut Self as *mut dyn LogicalHandler;
+        let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+        graph.add_edge(after, schedule)
     }
     fn restore_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
         self.scheduler.restore_external_prefix(request_id, tokens)

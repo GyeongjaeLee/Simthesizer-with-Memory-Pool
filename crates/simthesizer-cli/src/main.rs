@@ -7,9 +7,11 @@ use serde::Deserialize;
 use simthesizer_core::types::Request;
 use simthesizer_core::{Engine, Graph, System};
 
+mod saturation;
 mod write_jsonl;
 mod write_trace;
 
+use crate::saturation::{Saturated, Saturation};
 use crate::write_jsonl::write_results_jsonl;
 
 #[derive(Parser, Debug)]
@@ -23,6 +25,20 @@ struct Args {
     /// Component state at the engine clock, as JSONL.
     #[arg(long)]
     output_engine_trace: Option<PathBuf>,
+    /// Record only the first state at or after each of these times (s).
+    #[arg(long, num_args = 1.., requires = "output_engine_trace")]
+    trace_times: Vec<f64>,
+    /// Stop once the mean first-token wait (TTFT minus prefill) of calls
+    /// completed in a window exceeds this many seconds; then no results are
+    /// written and the status line reports saturation.
+    #[arg(long)]
+    saturation_wait: Option<f64>,
+    /// Window length in simulated seconds.
+    #[arg(long, default_value_t = 600.0)]
+    saturation_period: f64,
+    /// Consecutive windows over the wait that saturate the run.
+    #[arg(long, default_value_t = 2)]
+    saturation_windows: u32,
 }
 
 #[derive(Deserialize)]
@@ -62,26 +78,68 @@ fn main() -> Result<()> {
     let mut graph = Graph::new();
     load_workload(config.system.as_mut(), &mut graph, &workload_path)?;
 
-    let engine = Engine::new(graph, config.system);
-    let results = if let Some(path) = &args.output_engine_trace {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent)?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        let mut trace = write_trace::TraceWriter::new(std::io::BufWriter::new(file.as_file_mut()));
-        let results =
-            engine.run_with_observer(|time, system| trace.observe(time, system.observe()))?;
-        trace.finish()?;
-        file.persist_noclobber(path)?;
-        results
-    } else {
-        engine.run()?
+    let mut saturation = args
+        .saturation_wait
+        .map(|wait| Saturation::new(args.saturation_period, wait, args.saturation_windows))
+        .transpose()?;
+    anyhow::ensure!(
+        saturation.is_none() || config.system.first_token_waits().is_some(),
+        "this system does not report first-token waits for saturation detection"
+    );
+    let mut times = args.trace_times.clone();
+    anyhow::ensure!(
+        times.iter().all(|t| t.is_finite() && *t >= 0.0),
+        "trace times must be finite and nonnegative"
+    );
+    times.sort_by(f64::total_cmp);
+    let mut trace = match &args.output_engine_trace {
+        Some(path) => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let file = tempfile::NamedTempFile::new_in(parent)?;
+            let writer = std::io::BufWriter::new(file.as_file().try_clone()?);
+            Some((file, write_trace::TraceWriter::new(writer)))
+        }
+        None => None,
     };
-
-    write_results_jsonl(&args.output_jsonl, &results)?;
-
+    let mut next = 0;
+    let outcome = Engine::new(graph, config.system).run_with_observer(|time, system| {
+        if let Some((_, writer)) = &mut trace {
+            if times.is_empty() {
+                writer.observe(time, system.observe())?;
+            } else if next < times.len() && time >= times[next] {
+                while next < times.len() && time >= times[next] {
+                    next += 1;
+                }
+                writer.observe(time, system.observe())?;
+            }
+        }
+        if let Some(guard) = &mut saturation {
+            if let Some(mean_wait) = guard.check(time, system.first_token_waits().unwrap()) {
+                return Err(Saturated { time, mean_wait }.into());
+            }
+        }
+        Ok(())
+    });
+    let status = match outcome {
+        Ok(results) => {
+            write_results_jsonl(&args.output_jsonl, &results)?;
+            serde_json::json!({"status": "complete"})
+        }
+        Err(error) => {
+            let saturated = error.downcast::<Saturated>()?;
+            serde_json::json!({"status": "saturated", "time_s": saturated.time,
+                "mean_wait_s": saturated.mean_wait})
+        }
+    };
+    if let (Some((file, writer)), Some(path)) = (trace, &args.output_engine_trace) {
+        writer.finish()?;
+        file.persist_noclobber(path)?;
+    }
+    println!("{status}");
     Ok(())
 }
 

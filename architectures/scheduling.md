@@ -43,11 +43,18 @@ batch shape. A `Router` owns whole-request placement across instances.
   suffix when resumed. Transfer-protected storage remains unavailable until safe.
 - A token is emitted when an iteration brings KV up to the known tokens,
   including the final prefill chunk. The sampled token has no KV until the next
-  iteration.
+  iteration. A request completes once its prompt is computed and its outputs
+  are emitted, so a zero-output request still prefills its whole prompt.
 - Completion releases execution references. Cache contents survive until pressure
   requires reclamation; a successor reuses only proven available prefix identity.
 - Capacity waits permit other in-flight work to finish. A request that cannot
   make progress even alone fails instead of leaving an undrained simulation.
+- With external KV, a waiting request is looked up at its turn, as V1 asks its
+  connector. A step serves running requests, then those holding loaded external
+  KV (which pass waiting requests ahead of them), then looks up waiting requests
+  in FCFS order while a slot and token budget remain; a load takes neither.
+  `max_num_inflight_kv_loads` lets loads start without either and caps requests
+  holding KV before they run.
 - `max_batch` and `max_num_batched_tokens` are per rank and scale with `ep`.
 
 ## Prefix Cache

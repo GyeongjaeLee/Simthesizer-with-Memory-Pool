@@ -219,6 +219,14 @@ class ValidationTests(unittest.TestCase):
                 run(request([llm([1], kv_prefix=invalid)]))
         with self.assertRaisesRegex(ValueError, "alternative identities"):
             run(request([llm([1], kv_prefix=prefix, input_token_ids=[1, 2, 3, 4])]))
+        # An identity may extend an earlier call's: its parent's first `shared` IDs, then its own.
+        first = llm([1], next=[1], kv_prefix={**prefix, "block_ids": [1]})
+        run(request([first, llm([1], kv_prefix={**prefix, "parent": 0, "shared": 1, "block_ids": [3]})]))
+        for invalid in ({"parent": 1, "shared": 0}, {"parent": 0, "shared": 2}, {"shared": 1},
+                        {"parent": 0, "shared": 1, "namespace": "other"},
+                        {"parent": 0, "shared": 1, "block_ids": [3, 4]}):
+            with self.subTest(prefix=invalid), self.assertRaises(ValueError):
+                run(request([first, llm([1], kv_prefix={**prefix, "block_ids": [3], **invalid})]))
         for invalid in ({"prompt": -1, "completion": 1}, {"prompt": 9},
                         {"prompt": 9, "completion": 2**32}):
             with self.assertRaises(ValueError):

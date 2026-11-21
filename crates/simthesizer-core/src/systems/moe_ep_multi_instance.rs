@@ -14,7 +14,7 @@ use crate::scheduler::Scheduler;
 use crate::system::{pending_llm_load, System, SystemEvent};
 use crate::types::{
     InstanceLoad, NodeID, ParallelStrategy, ReadySubRequest, Request, RequestResult,
-    ResultSubRequest, SubRequest, SubRequestCompletion,
+    ResultSubRequest, SubRequest, SubRequestCompletion, TtftParts,
 };
 
 #[derive(Deserialize)]
@@ -218,6 +218,11 @@ impl MoeEpMultiInstanceSystem {
                         session_id: sub_request.session_id().map(str::to_owned),
                         provider_tokens: sub_request.provider_tokens().cloned(),
                         kv_prefix: sub_request.kv_prefix().cloned(),
+                        ttft_parts: TtftParts::scheduled(
+                            completion.token_latency.first().copied(),
+                            completion.queue_wait,
+                        ),
+                        reused_tokens: None,
                     },
                     SubRequest::ToolCall {
                         input_tokens,
@@ -322,6 +327,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                                 subrequest_index,
                                 completion_node_id,
                                 token_latency: Vec::new(),
+                                queue_wait: None,
                             },
                         )?;
                         let run = graph.add_logical_node(
@@ -414,7 +420,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                         output_token_ids.clone(),
                         known_tokens,
                         kv_tokens,
-                        sub_request.kv_prefix().cloned(),
+                        active.request.resolved_kv_prefix(subrequest_index),
                     )
                 };
                 self.schedulers[instance_index].enqueue_sub_request(ReadySubRequest {
@@ -445,6 +451,25 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
                     graph.add_edge(current, retry)?;
                     graph.add_edge(capacity, retry)?;
+                    return Ok(0.0);
+                }
+                // A request at its turn first looks up its external prefix.
+                let lookups: Vec<_> = self
+                    .schedulers
+                    .iter()
+                    .filter_map(|scheduler| scheduler.external_lookup())
+                    .collect();
+                if !lookups.is_empty() {
+                    let mut previous = current;
+                    for request in lookups {
+                        let sink = self.request_sinks[&request];
+                        let lookup =
+                            graph.add_logical_node(sink, SystemEvent::KvLookup { request });
+                        graph.add_edge(previous, lookup)?;
+                        previous = lookup;
+                    }
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(previous, retry)?;
                     return Ok(0.0);
                 }
                 let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
@@ -478,7 +503,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 let mut instance_batches = Vec::with_capacity(self.schedulers.len());
                 let mut has_work = false;
                 for scheduler in &mut self.schedulers {
-                    let batch = scheduler.schedule()?;
+                    let batch = scheduler.schedule(now)?;
                     has_work |= !batch.is_empty();
                     instance_batches.push(batch);
                 }
@@ -628,6 +653,44 @@ impl System for MoeEpMultiInstanceSystem {
         self.schedulers
             .get(*ranks.first()?)?
             .external_kv_requirement()
+    }
+    fn known_tokens(&self, request_id: u64) -> Option<u32> {
+        self.schedulers
+            .iter()
+            .find_map(|s| s.known_tokens(request_id))
+    }
+    fn external_admission_bytes(
+        &self,
+        rank: usize,
+        known_tokens: u32,
+        restored_tokens: u32,
+    ) -> u64 {
+        self.schedulers.get(rank).map_or(0, |s| {
+            s.external_admission_bytes(known_tokens, restored_tokens)
+        })
+    }
+    fn reserve_external_admission(
+        &mut self,
+        request_id: u64,
+        rank: usize,
+        bytes: u64,
+    ) -> Result<()> {
+        self.schedulers
+            .get_mut(rank)
+            .ok_or_else(|| anyhow!("invalid external KV rank"))?
+            .reserve_external_admission(request_id, bytes);
+        Ok(())
+    }
+    fn set_external_pending(&mut self, request_id: u64, pending: bool) -> Result<()> {
+        for scheduler in &mut self.schedulers {
+            scheduler.set_external_pending(request_id, pending);
+        }
+        Ok(())
+    }
+    fn wake(&mut self, after: NodeID, graph: &mut Graph) -> Result<()> {
+        let module = self as *mut Self as *mut dyn LogicalHandler;
+        let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+        graph.add_edge(after, schedule)
     }
     fn restore_external_prefix(&mut self, request_id: u64, tokens: u32) -> Result<()> {
         for scheduler in &mut self.schedulers {

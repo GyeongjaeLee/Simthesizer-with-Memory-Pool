@@ -26,6 +26,10 @@ that step, and optional `input_token_ids` / `output_token_ids` are that step's
 own token trace. Runtime never derives context or KV lineage from predecessor
 completions. Prefix identity comes from token IDs or an explicit `kv_prefix`
 (`namespace`, `block_tokens`, ordered unsigned 64-bit `block_ids`), never both.
+A `kv_prefix` may name an earlier LLM sub-request of the same row as `parent`;
+its full list is then the parent's first `shared` IDs followed by `block_ids`.
+This only compresses the row: identity never depends on execution, and both
+calls keep their namespace and block size.
 The namespace identifies compatible model/layout and sharing scope; reuse
 requires a continuous matching prefix. Request-level token counts do not exist.
 
@@ -44,7 +48,10 @@ as disaggregated decode does. Committed workloads omit it, which means
 ## Results
 
 A result row repeats the request's DAG, arrival, token counts, intervals, and
-tool durations, and adds one `token_latency` array per `llm` sub-request.
+tool durations, and adds one `token_latency` array per `llm` sub-request. A
+scheduled call also reports `ttft_parts` (`kv_load`, `admission`, `queue`,
+`prefill`), which sum to its first latency; a pool call also reports
+`reused_tokens`, the prompt tokens restored from cached KV.
 Entry 0 is the time from entering the scheduler to the first token; later
 entries are inter-token latencies. Keeping both in one array prevents them from
 drifting apart.
@@ -65,21 +72,26 @@ drifting apart.
 
 `scripts/freeinference.py` fetches pinned compressed sources, verifies and
 indexes sessions, and generates native DAGs. Arrival mode selects original
-session timestamps, regular session/s, or seeded Poisson session/s.
+session timestamps, regular session/s, or seeded Poisson session/s. Sessions
+are taken in source start order or a seeded shuffle. A horizon replaces the
+session count: sessions arrive until it, nodes that cannot start before it
+even with instantaneous LLM calls are dropped, and sessions beyond the eligible
+set replay as copies with their own session and KV identities.
 
 Default `provider-count` mode uses provider prompt/completion counts and emits
-no prefix identity. `proxy-prefix` recovers original complete 16-token
-`o200k_base` block lists from verified raw sources; input length is 16 times
-their count. Its namespace contains dataset revision, week, source model,
+no prefix identity. `proxy-prefix` uses original complete 16-token
+`o200k_base` block lists; input length is 16 times their count. The index
+reads each verified raw file once, in parallel, storing each call as the IDs
+after those shared with the previous call of its agent; generation reads only
+the index. Each identity names that previous call as its `parent`. Its namespace contains dataset revision, week, source model,
 explicit target model/KV layout and sharing scope. Session ownership remains
 separate. The configured native model supplies KV bytes and compute costs.
 
 Both modes retain provider counts. Provider completion is only a generation
 length approximation; it is not a measured proxy-tokenizer count. Partial final
 proxy blocks (0–15 tokens) are absent, and output-to-next-input identity cannot
-be recovered. The converter never synthesizes those identities. Compact indexes
-retain counts; proxy generation streams each selected raw file once and spools
-selected sessions, avoiding corpus-wide block arrays in memory.
+be recovered. The converter never synthesizes those identities. Rows, the index
+and runtime memory grow with distinct blocks, not with repeated prefixes.
 
 Nested sessions become branches. Mid-response launches use observed delay
 from parent release; later launches follow parent completion. A child that

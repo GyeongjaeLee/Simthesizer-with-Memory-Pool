@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::flow::{FlowNetworkSimulator, RouteInfo};
@@ -107,11 +107,16 @@ pub struct Topology {
 pub struct TopologyNetwork {
     pub flow: FlowNetworkSimulator,
     topology: Topology,
+    /// Name -> index in `topology.endpoints`.
+    endpoint_index: BTreeMap<String, usize>,
+    /// (worker, rank) -> index in `topology.workers`.
+    binding_index: BTreeMap<(usize, usize), usize>,
     ids: BTreeMap<String, NetworkDeviceID>,
     lanes: BTreeMap<String, u32>,
     cuts: BTreeMap<String, DirectedCut>,
     adapter_links: BTreeMap<String, (usize, usize)>,
-    transfer_routes: Vec<TransferRoute>,
+    /// Distinct routes used, with their first-use order.
+    transfer_routes: BTreeMap<TransferRoute, usize>,
     trunks: Vec<Trunk>,
 }
 
@@ -125,7 +130,7 @@ struct Trunk {
     members: Vec<(String, bool)>,
 }
 
-#[derive(PartialEq, Serialize)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct TransferRoute {
     src: String,
     dst: String,
@@ -180,23 +185,30 @@ impl Topology {
                     "memory {} needs positive capacity_bytes",
                     endpoint.id
                 );
-                let read = endpoint
-                    .read_bandwidth
-                    .ok_or_else(|| anyhow!("memory {} needs read_bandwidth", endpoint.id))?;
-                let write = endpoint
-                    .write_bandwidth
-                    .ok_or_else(|| anyhow!("memory {} needs write_bandwidth", endpoint.id))?;
-                let port = flow.add_device();
-                ports.insert(endpoint.id.clone(), port);
-                flow.add_named_link(id, port, read, 0.0, format!("{}:read", endpoint.id))?;
-                flow.add_named_link(port, id, write, 0.0, format!("{}:write", endpoint.id))?;
-            } else {
                 ensure!(
-                    endpoint.read_bandwidth.is_none() && endpoint.write_bandwidth.is_none(),
-                    "read/write rates are memory service inputs; use explicit links for {}",
+                    endpoint.read_bandwidth.is_some() && endpoint.write_bandwidth.is_some(),
+                    "memory {} needs read_bandwidth and write_bandwidth",
                     endpoint.id
                 );
-                ports.insert(endpoint.id.clone(), id);
+            }
+            // A memory or host DRAM serves all its traffic through one read
+            // and one write link behind its port.
+            match (endpoint.read_bandwidth, endpoint.write_bandwidth) {
+                (Some(read), Some(write))
+                    if matches!(endpoint.kind, EndpointKind::Memory | EndpointKind::Dram) =>
+                {
+                    let port = flow.add_device();
+                    ports.insert(endpoint.id.clone(), port);
+                    flow.add_named_link(id, port, read, 0.0, format!("{}:read", endpoint.id))?;
+                    flow.add_named_link(port, id, write, 0.0, format!("{}:write", endpoint.id))?;
+                }
+                (None, None) => {
+                    ports.insert(endpoint.id.clone(), id);
+                }
+                _ => bail!(
+                    "{} needs both or neither read/write rates; only memory and DRAM take them",
+                    endpoint.id
+                ),
             }
         }
         let mut physical_ports = HashSet::new();
@@ -341,6 +353,19 @@ impl Topology {
                 members,
             });
         }
+        // CXL transfers between pool devices and adapters stay on the switch fabric.
+        flow.confine(
+            self.endpoints
+                .iter()
+                .filter(|endpoint| {
+                    matches!(
+                        endpoint.kind,
+                        EndpointKind::Switch | EndpointKind::Adapter | EndpointKind::Memory
+                    )
+                })
+                .flat_map(|endpoint| [ids[&endpoint.id], ports[&endpoint.id]])
+                .collect(),
+        );
         let mut adapters = HashMap::new();
         for endpoint in &self.endpoints {
             match endpoint.kind {
@@ -368,6 +393,10 @@ impl Topology {
                 _ => {}
             }
         }
+        let has_memory = self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == EndpointKind::Memory);
         let mut workers = HashSet::new();
         for worker in &self.workers {
             ensure!(
@@ -377,7 +406,7 @@ impl Topology {
                 worker.rank
             );
             ensure!(
-                !worker.adapters.is_empty(),
+                !worker.adapters.is_empty() || !has_memory,
                 "worker {} rank {} needs at least one adapter",
                 worker.worker,
                 worker.rank
@@ -417,68 +446,87 @@ impl Topology {
         let mut network = TopologyNetwork {
             flow,
             topology: self.clone(),
+            endpoint_index: self
+                .endpoints
+                .iter()
+                .enumerate()
+                .map(|(index, endpoint)| (endpoint.id.clone(), index))
+                .collect(),
+            binding_index: self
+                .workers
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| ((binding.worker, binding.rank), index))
+                .collect(),
             ids,
             lanes,
             cuts,
             adapter_links,
-            transfer_routes: Vec::new(),
+            transfer_routes: BTreeMap::new(),
             trunks,
         };
-        // A declared worker must be able to spill and reload every pool device.
-        let mut defaults = HashSet::new();
+        // Every worker must spill to and reload from every pool device through
+        // each adapter, and reach other workers through the NICs. Reachability
+        // is searched once per source; routes are enumerated on first use.
+        let devices = network.memory_ids();
+        let mut reach = HashMap::new();
+        let mut defaults = BTreeMap::new();
         for worker in &self.workers {
-            for device in network.memory_ids() {
+            let context = || format!("worker {} rank {}", worker.worker, worker.rank);
+            for device in &devices {
                 for adapter in &worker.adapters {
-                    for (src, dst) in [(&worker.dram, &device), (&device, &worker.gpu)] {
-                        let via = vec![network.endpoint(adapter)?];
-                        network
-                            .flow
-                            .check_waypoints(network.endpoint(src)?, network.endpoint(dst)?, &via)
-                            .with_context(|| {
-                                format!(
-                                    "worker {} rank {} route {src} -> {dst} via {adapter}",
-                                    worker.worker, worker.rank
-                                )
-                            })?;
-                    }
+                    network
+                        .check_stops(&[&worker.dram, adapter, device], &mut reach)
+                        .and_then(|_| {
+                            network.check_stops(&[device, adapter, &worker.gpu], &mut reach)
+                        })
+                        .with_context(context)?;
                 }
-                for (src, dst) in [(&worker.dram, &device), (&device, &worker.gpu)] {
-                    if defaults.insert((src.clone(), dst.clone())) {
-                        network.set_route(src, dst, &[&worker.adapters[0]])?;
-                    }
+                for (src, dst) in [(&worker.dram, device), (device, &worker.gpu)] {
+                    defaults
+                        .entry((src.clone(), dst.clone()))
+                        .or_insert_with(|| vec![worker.adapters[0].clone()]);
                 }
             }
             for destination in &self.workers {
                 let via = if worker.node == destination.node {
                     Vec::new()
                 } else {
-                    vec![worker.nic.as_str(), destination.nic.as_str()]
+                    vec![worker.nic.clone(), destination.nic.clone()]
                 };
-                if defaults.insert((worker.dram.clone(), destination.gpu.clone())) {
-                    network
-                        .set_route(&worker.dram, &destination.gpu, &via)
-                        .with_context(|| {
-                            format!(
-                                "worker {} DRAM route to worker {}",
-                                worker.worker, destination.worker
-                            )
-                        })?;
-                }
+                let stops = std::iter::once(&worker.dram)
+                    .chain(&via)
+                    .chain([&destination.gpu])
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                network.check_stops(&stops, &mut reach).with_context(|| {
+                    format!("{} DRAM route to worker {}", context(), destination.worker)
+                })?;
+                defaults
+                    .entry((worker.dram.clone(), destination.gpu.clone()))
+                    .or_insert(via);
             }
         }
+        for ((src, dst), via) in defaults {
+            network.set_route(
+                &src,
+                &dst,
+                &via.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?;
+        }
         for route in &self.required_routes {
-            if route.via.is_empty() {
-                network
-                    .flow
-                    .check_route(network.endpoint(&route.src)?, network.endpoint(&route.dst)?)
-            } else {
-                network.set_route(
-                    &route.src,
-                    &route.dst,
-                    &route.via.iter().map(String::as_str).collect::<Vec<_>>(),
-                )
-            }
-            .with_context(|| format!("required route {} -> {}", route.src, route.dst))?;
+            let via = route.via.iter().map(String::as_str).collect::<Vec<_>>();
+            let stops = [&[route.src.as_str()][..], &via, &[route.dst.as_str()]].concat();
+            network
+                .check_stops(&stops, &mut reach)
+                .and_then(|_| {
+                    if via.is_empty() {
+                        Ok(())
+                    } else {
+                        network.set_route(&route.src, &route.dst, &via)
+                    }
+                })
+                .with_context(|| format!("required route {} -> {}", route.src, route.dst))?;
         }
         Ok(network)
     }
@@ -491,7 +539,32 @@ impl TopologyNetwork {
             .map(|name| self.endpoint(name))
             .collect::<Result<Vec<_>>>()?;
         self.flow
-            .set_waypoints(self.endpoint(src)?, self.endpoint(dst)?, waypoints)
+            .set_waypoints(self.endpoint(src)?, self.endpoint(dst)?, waypoints);
+        Ok(())
+    }
+
+    /// Each consecutive pair of `stops` must be connected; `reach` caches
+    /// reachable sets by source and confinement.
+    fn check_stops(
+        &self,
+        stops: &[&str],
+        reach: &mut HashMap<(NetworkDeviceID, bool), HashSet<NetworkDeviceID>>,
+    ) -> Result<()> {
+        for pair in stops.windows(2) {
+            let (src, dst) = (self.endpoint(pair[0])?, self.endpoint(pair[1])?);
+            let confined = self.flow.confined(src, dst);
+            let reachable = reach
+                .entry((src, confined))
+                .or_insert_with(|| self.flow.reachable(src, confined));
+            ensure!(
+                reachable.contains(&dst),
+                "no directed {}route from {} to {}",
+                if confined { "CXL fabric " } else { "" },
+                pair[0],
+                pair[1]
+            );
+        }
+        Ok(())
     }
 
     pub fn endpoint(&self, name: &str) -> Result<NetworkDeviceID> {
@@ -502,11 +575,17 @@ impl TopologyNetwork {
     }
 
     pub fn worker_rank(&self, worker: usize, rank: usize) -> Result<&WorkerBinding> {
-        self.topology
-            .workers
-            .iter()
-            .find(|binding| binding.worker == worker && binding.rank == rank)
+        self.binding_index
+            .get(&(worker, rank))
+            .map(|&index| &self.topology.workers[index])
             .ok_or_else(|| anyhow!("unknown topology worker {worker} rank {rank}"))
+    }
+
+    fn memory_endpoint(&self, name: &str) -> Option<&Endpoint> {
+        self.endpoint_index
+            .get(name)
+            .map(|&index| &self.topology.endpoints[index])
+            .filter(|endpoint| endpoint.kind == EndpointKind::Memory)
     }
 
     pub fn transfer_route(
@@ -523,12 +602,7 @@ impl TopologyNetwork {
         let destination = destination_owner
             .map(|(worker, rank)| self.worker_rank(worker, rank))
             .transpose()?;
-        let is_memory = |name: &str| {
-            self.topology
-                .endpoints
-                .iter()
-                .any(|e| e.id == name && e.kind == EndpointKind::Memory)
-        };
+        let is_memory = |name: &str| self.memory_endpoint(name).is_some();
         let adapter_owner = if is_memory(src) {
             destination
         } else if is_memory(dst) {
@@ -593,9 +667,8 @@ impl TopologyNetwork {
             network_src,
             network_dst,
         };
-        if !self.transfer_routes.contains(&route) {
-            self.transfer_routes.push(route);
-        }
+        let order = self.transfer_routes.len();
+        self.transfer_routes.entry(route).or_insert(order);
         Ok((network_src, network_dst))
     }
 
@@ -609,10 +682,7 @@ impl TopologyNetwork {
     }
 
     pub fn memory_capacity(&self, name: &str) -> Result<u64> {
-        self.topology
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.id == name && endpoint.kind == EndpointKind::Memory)
+        self.memory_endpoint(name)
             .and_then(|endpoint| endpoint.capacity_bytes)
             .ok_or_else(|| anyhow!("unknown memory endpoint {name}"))
     }
@@ -660,8 +730,14 @@ impl TopologyNetwork {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let mut routes = self.transfer_routes.iter().collect::<Vec<_>>();
+        routes.sort_by_key(|(_, &order)| order);
+        let routes = routes
+            .into_iter()
+            .map(|(route, _)| route)
+            .collect::<Vec<_>>();
         serde_json::json!({"inventory": self.topology, "endpoint_ids": self.ids,
             "lanes": self.lanes, "cuts": self.cuts, "adapters": adapters,
-            "transfer_routes": self.transfer_routes, "flow": flow})
+            "transfer_routes": routes, "flow": flow})
     }
 }

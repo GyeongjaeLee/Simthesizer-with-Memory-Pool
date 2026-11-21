@@ -29,6 +29,15 @@ def interpolate(x, x0, x1, y0, y1):
     return y1 + max(0.0, y1 - y0) * (x - x1) / (x1 - x0)
 
 
+def tail(points):
+    """Least-squares slope over the upper half of the range (at least the last
+    two samples), never negative."""
+    start = min(bisect.bisect_left([x for x, _ in points], points[-1][0] / 2), max(len(points) - 2, 0))
+    xs, ys = np.array([p[0] for p in points[start:]]), np.array([p[1] for p in points[start:]])
+    spread = ((xs - xs.mean()) ** 2).sum()
+    return max(0.0, ((xs - xs.mean()) * (ys - ys.mean())).sum() / spread) if spread > 0 else 0.0
+
+
 class Surface:
     def __init__(self, rows):
         curves = {}
@@ -36,21 +45,24 @@ class Surface:
             curves.setdefault(outer, {}).setdefault(inner, []).append(y)
         self.keys = sorted(curves)
         self.curves = [sorted((x, np.mean(ys)) for x, ys in curves[k].items()) for k in self.keys]
+        self.tails = [tail(points) for points in self.curves]
 
-    @staticmethod
-    def curve(points, x):
+    def curve(self, index, x):
+        points = self.curves[index]
         xs = [p[0] for p in points]
         if x <= xs[0] or len(xs) == 1:
             return points[0][1]
-        i = min(bisect.bisect_left(xs, x), len(xs) - 1)
+        if x > xs[-1]:
+            return points[-1][1] + self.tails[index] * (x - xs[-1])
+        i = bisect.bisect_left(xs, x)
         return interpolate(x, *xs[i - 1:i + 1], points[i - 1][1], points[i][1])
 
     def at(self, outer, inner):
         if outer <= self.keys[0] or len(self.keys) == 1:
-            return self.curve(self.curves[0], inner)
+            return self.curve(0, inner)
         i = min(bisect.bisect_left(self.keys, outer), len(self.keys) - 1)
         return interpolate(outer, self.keys[i - 1], self.keys[i],
-                           self.curve(self.curves[i - 1], inner), self.curve(self.curves[i], inner))
+                           self.curve(i - 1, inner), self.curve(i, inner))
 
 
 class Table:

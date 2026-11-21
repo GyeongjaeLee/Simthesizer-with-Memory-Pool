@@ -300,6 +300,8 @@ impl PdDisaggregationSystem {
                 kv_prefix: original.sub_requests[0].kv_prefix().cloned(),
                 session_id: original.sub_requests[0].session_id().map(str::to_owned),
                 provider_tokens: original.sub_requests[0].provider_tokens().cloned(),
+                ttft_parts: None,
+                reused_tokens: None,
             }],
         })
     }

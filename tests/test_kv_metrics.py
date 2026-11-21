@@ -66,24 +66,18 @@ class KvMetricsTests(unittest.TestCase):
         self.assertEqual(result["execution_by_scope"]["/instances/0/scheduler"]["gpu_idle_s"], 3)
         self.assertEqual(result["execution_by_scope"]["/instances/1/scheduler"]["gpu_idle_s"], 3)
 
-    def test_cxl_initial_waits_and_child_resume_waits_are_counted_once(self):
+    def test_cxl_waits_come_only_from_worker_schedulers(self):
+        # Gauges a parent exported before calls enqueued on release are ignored.
         initial = {
-            "cxl_pool": {
-                "hbm_admission_waiting_requests": 1,
-                "kv_preparation_waiting_requests": 2,
-                "events": [{"scheduler": {"unrelated": True}}],
-            },
-            "instances": [{"scheduler": scheduler(True, preparation=1)}],
+            "cxl_pool": {"kv_preparation_waiting_requests": 1, "events": [{"scheduler": {}}]},
+            "instances": [{"scheduler": scheduler(True, preparation=1, admission=1)}],
         }
         final = copy.deepcopy(initial)
-        final["cxl_pool"]["hbm_admission_waiting_requests"] = 0
-        final["cxl_pool"]["kv_preparation_waiting_requests"] = 0
         final["instances"][0]["scheduler"] = scheduler()
         result = integrate([row(0, **initial), row(2, **final)])
+        self.assertEqual(result["totals"]["kv_preparation_wait_request_s"], 2)
         self.assertEqual(result["totals"]["hbm_admission_wait_request_s"], 2)
-        self.assertEqual(result["totals"]["kv_preparation_wait_request_s"], 6)
-        self.assertEqual(result["totals"]["waiting_request_s"], 8)
-        self.assertEqual(result["totals"]["all_execution_domains_idle_s"], 0)
+        self.assertEqual(list(result["waits_by_scope"]), ["/instances/0/scheduler"])
 
     def test_joint_ep_execution_covers_idle_attention_rank(self):
         result = integrate([
@@ -102,7 +96,6 @@ class KvMetricsTests(unittest.TestCase):
             {"scheduler": scheduler(running=1)},
             {"scheduler": scheduler(queued=0.5)},
             {"schedulers": [scheduler(), scheduler()]},
-            {"scheduler": scheduler(), "cxl_pool": {}},
         ]:
             with self.subTest(state=state), self.assertRaises(ValueError):
                 integrate([row(0, **state)])

@@ -95,6 +95,8 @@ fn proxy(id: u64, namespace: &str, blocks: &[u64], output: u32) -> ReadySubReque
     request.kv_prefix = Some(KvPrefix {
         namespace: namespace.into(),
         block_tokens: 4,
+        parent: None,
+        shared: 0,
         block_ids: blocks.to_vec(),
     });
     request
@@ -107,7 +109,7 @@ fn shape(batch: &[RequestState]) -> Vec<(u32, u32)> {
 fn complete_one(scheduler: &mut dyn Scheduler, request: ReadySubRequest, now: f64) {
     let expected = request.request_id;
     scheduler.enqueue_sub_request(request);
-    assert_eq!(scheduler.schedule().unwrap().len(), 1);
+    assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
     let completed = scheduler.done_iteration(now);
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].request_id, expected);
@@ -127,7 +129,7 @@ fn compatible_proxy_identity_reuses_across_requests_after_release() {
     later.arrival_time = 1000.0;
     scheduler.enqueue_sub_request(later);
     // The final block is recomputed for logits, even after a complete cache hit.
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 8)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 8)]);
     assert_eq!(scheduler.done_iteration(1001.0)[0].token_latency, [1.0]);
 }
 
@@ -145,7 +147,7 @@ fn proxy_namespace_and_continuous_parent_identity_control_hits() {
             1.0,
         );
         scheduler.enqueue_sub_request(proxy(1, namespace, &blocks, 1));
-        assert_eq!(shape(&scheduler.schedule().unwrap()), [expected]);
+        assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [expected]);
     }
 }
 
@@ -175,13 +177,15 @@ fn original_sixteen_token_proxy_blocks_reuse_at_compatible_storage_boundaries() 
         first.kv_prefix = Some(KvPrefix {
             namespace: "revision/week/source/target/layout/scope".into(),
             block_tokens: 16,
+            parent: None,
+            shared: 0,
             block_ids: vec![1, 2, 3],
         });
         complete_one(scheduler.as_mut(), first.clone(), 1.0);
         first.request_id = 1;
         first.completion_node_id = 1;
         scheduler.enqueue_sub_request(first);
-        assert_eq!(shape(&scheduler.schedule().unwrap()), [(16, 32)]);
+        assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(16, 32)]);
     }
 }
 
@@ -193,7 +197,7 @@ fn repeated_request_membership_without_identity_is_a_cache_miss() {
     next_call.subrequest_index = 1;
     next_call.completion_node_id = 1;
     scheduler.enqueue_sub_request(next_call);
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(12, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(12, 0)]);
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
 }
 
@@ -202,13 +206,13 @@ fn generated_proxy_decode_cannot_establish_next_input_identity() {
     let mut scheduler = scheduler(64, 64, 1, true);
     scheduler.enqueue_sub_request(proxy(0, "shared", &[1, 2], 9));
     for now in 1..=9 {
-        assert_eq!(scheduler.schedule().unwrap().len(), 1);
+        assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
         let completed = scheduler.done_iteration(f64::from(now));
         assert_eq!(completed.len(), usize::from(now == 9));
     }
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 16);
     scheduler.enqueue_sub_request(proxy(1, "shared", &[1, 2, 3, 4], 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(8, 8)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(8, 8)]);
 }
 
 #[test]
@@ -219,7 +223,7 @@ fn partial_input_identity_does_not_extend_through_unknown_tokens() {
     first.known_tokens = 7;
     complete_one(scheduler.as_mut(), first, 1.0);
     scheduler.enqueue_sub_request(proxy(1, "shared", &[1, 2, 3], 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(8, 4)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(8, 4)]);
 }
 
 #[test]
@@ -230,14 +234,14 @@ fn cache_pressure_reclaims_only_the_tail_blocks_needed() {
     complete_one(scheduler.as_mut(), request(1, 4, 1), 2.0);
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
     scheduler.enqueue_sub_request(proxy(2, "shared", &[1, 2, 3], 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 8)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 8)]);
 }
 
 #[test]
 fn full_known_input_admission_does_not_physically_reserve_the_prompt() {
     let mut scheduler = scheduler(16, 1, 1, false);
     scheduler.enqueue_sub_request(request(0, 16, 1000));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 4);
     assert!(scheduler.done_iteration(1.0).is_empty());
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 4);
@@ -248,12 +252,12 @@ fn full_input_admission_gate_does_not_evict_cache_for_future_prompt_chunks() {
     let mut scheduler = scheduler(16, 1, 1, true);
     scheduler.enqueue_sub_request(proxy(0, "shared", &[1, 2, 3], 1));
     for now in 1..=12 {
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(f64::from(now));
     }
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
     scheduler.enqueue_sub_request(request(1, 16, 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 0)]);
     // The full input fits after hypothetical reclamation; only four bytes are
     // needed now, so all twelve cached bytes remain physically resident.
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
@@ -265,7 +269,7 @@ fn impossible_full_input_gate_leaves_reclaimable_cache_intact() {
     let mut scheduler = scheduler(12, 64, 1, true);
     complete_one(scheduler.as_mut(), proxy(0, "shared", &[1, 2, 3], 1), 1.0);
     scheduler.enqueue_sub_request(request(1, 16, 1));
-    assert!(scheduler.schedule().is_err());
+    assert!(scheduler.schedule(0.0).is_err());
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
 }
 
@@ -274,7 +278,7 @@ fn future_output_length_does_not_change_initial_admission() {
     let mut scheduler = scheduler(8, 8, 2, false);
     scheduler.enqueue_sub_request(request(0, 3, 1000));
     scheduler.enqueue_sub_request(request(1, 3, 1000));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(3, 0), (3, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(3, 0), (3, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 8);
 }
 
@@ -284,9 +288,9 @@ fn full_input_gate_blocks_the_fcfs_head_without_bypassing_it() {
     scheduler.enqueue_sub_request(request(0, 3, 3));
     scheduler.enqueue_sub_request(request(1, 8, 1));
     scheduler.enqueue_sub_request(request(2, 1, 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(3, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(3, 0)]);
     assert!(scheduler.done_iteration(1.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 3)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 3)]);
     assert_eq!(scheduler.observe()["waiting_requests"], 2);
 }
 
@@ -295,7 +299,7 @@ fn disabling_full_input_gate_changes_chunk_admission_only() {
     let mut scheduler = configured(8, 4, 2, false, 0, false);
     scheduler.enqueue_sub_request(request(0, 3, 3));
     scheduler.enqueue_sub_request(request(1, 8, 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(3, 0), (1, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(3, 0), (1, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 8);
 }
 
@@ -304,7 +308,7 @@ fn lookahead_uses_block_rounded_capacity_without_publishing_future_kv() {
     let mut scheduler = configured(8, 8, 2, true, 2, true);
     scheduler.enqueue_sub_request(proxy(0, "shared", &[1], 2));
     scheduler.enqueue_sub_request(request(1, 3, 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 8);
     assert!(scheduler.done_iteration(1.0).is_empty());
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 4);
@@ -314,7 +318,7 @@ fn lookahead_uses_block_rounded_capacity_without_publishing_future_kv() {
 fn lookahead_applies_to_current_work_not_the_full_input_admission_gate() {
     let mut scheduler = configured(16, 1, 1, false, 2, true);
     scheduler.enqueue_sub_request(request(0, 16, 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 4);
 }
 
@@ -325,14 +329,14 @@ fn memory_growth_preempts_the_newest_running_request_and_resumes_it() {
         scheduler.enqueue_sub_request(request(id, 4, 3));
     }
     assert_eq!(
-        shape(&scheduler.schedule().unwrap()),
+        shape(&scheduler.schedule(0.0).unwrap()),
         [(4, 0), (4, 0), (4, 0)]
     );
     assert!(scheduler.done_iteration(1.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 4), (1, 4)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 4), (1, 4)]);
     assert_eq!(scheduler.observe()["preemptions_total"], 1);
     assert!(scheduler.done_iteration(2.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 5), (1, 5)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 5), (1, 5)]);
     let completed = scheduler.done_iteration(3.0);
     assert_eq!(
         completed
@@ -342,24 +346,24 @@ fn memory_growth_preempts_the_newest_running_request_and_resumes_it() {
         [0, 1]
     );
     // Request 2 resumes its five known tokens, including its already emitted token.
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(5, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(5, 0)]);
     assert!(scheduler.done_iteration(4.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 5)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 5)]);
     assert_eq!(scheduler.done_iteration(5.0)[0].request_id, 2);
-    assert!(scheduler.schedule().unwrap().is_empty());
+    assert!(scheduler.schedule(0.0).unwrap().is_empty());
 }
 
 #[test]
 fn hybrid_replay_requires_a_retained_recurrent_checkpoint() {
     let mut scheduler = hybrid(64, 64);
     scheduler.enqueue_sub_request(proxy(0, "hybrid", &[1, 2], 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 12);
     assert!(scheduler.done_iteration(1.0).is_empty());
     // Four attention bytes and the eight-byte replay checkpoint own the state.
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 12);
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 4)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 4)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 24);
     assert_eq!(scheduler.done_iteration(2.0).len(), 1);
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 16);
@@ -367,9 +371,9 @@ fn hybrid_replay_requires_a_retained_recurrent_checkpoint() {
 
     // Both attention blocks survived, but only the boundary at four has state.
     scheduler.enqueue_sub_request(proxy(1, "hybrid", &[1, 2, 3], 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 4)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 4)]);
     assert!(scheduler.done_iteration(3.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 8)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 8)]);
     assert_eq!(scheduler.done_iteration(4.0).len(), 1);
 }
 
@@ -378,15 +382,15 @@ fn hybrid_live_state_copies_exist_only_while_crossing_a_state_block() {
     let mut scheduler = hybrid(64, 64);
     scheduler.enqueue_sub_request(proxy(0, "hybrid", &[1, 2], 5));
     for now in 1..=2 {
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         assert!(scheduler.done_iteration(f64::from(now)).is_empty());
     }
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 8)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 8)]);
     // Checkpoint 8 + attention 8 + new attention 4 + old/new live state 16.
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 36);
     assert!(scheduler.done_iteration(3.0).is_empty());
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 28);
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 9)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 9)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 28);
 }
 
@@ -406,10 +410,10 @@ fn hybrid_without_prefix_caching_uses_one_live_state() {
         )
         .unwrap();
     scheduler.enqueue_sub_request(request(0, 4, 2));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(4, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(4, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 12);
     assert!(scheduler.done_iteration(1.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 4)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 4)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 16);
 }
 
@@ -429,10 +433,10 @@ fn hybrid_lookahead_reserves_attention_without_inventing_future_state_copies() {
         )
         .unwrap();
     scheduler.enqueue_sub_request(proxy(0, "hybrid", &[1, 2], 1));
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 0)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 16);
     assert!(scheduler.done_iteration(1.0).is_empty());
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 1)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 1)]);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 16);
 }
 
@@ -441,13 +445,13 @@ fn hybrid_checkpoint_is_reclaimable_after_copy_source_consumption() {
     let mut scheduler = hybrid(32, 64);
     scheduler.enqueue_sub_request(proxy(0, "hybrid", &[1, 2], 5));
     for now in 1..=2 {
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         assert!(scheduler.done_iteration(f64::from(now)).is_empty());
     }
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 16);
     // Attention stays execution-pinned, but the consumed checkpoint can yield
     // eight bytes for the next old/new live-state pair without preemption.
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 8)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 8)]);
     assert_eq!(scheduler.observe()["prefix_cache_bytes"], 8);
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 28);
     assert_eq!(scheduler.observe()["preemptions_total"], 0);
@@ -461,11 +465,11 @@ fn external_capacity_wait_preserves_the_fcfs_admission_barrier() {
         scheduler.enqueue_sub_request(request(id, 4, 1));
     }
     scheduler.set_external_admission_blocked(0, true);
-    assert!(scheduler.schedule().unwrap().is_empty());
+    assert!(scheduler.schedule(0.0).unwrap().is_empty());
     assert_eq!(scheduler.observe()["hbm_admission_waiting_requests"], 3);
     assert_eq!(scheduler.observe()["scheduler_waiting_requests"], 0);
     scheduler.set_external_admission_blocked(0, false);
-    assert_eq!(scheduler.schedule().unwrap().len(), 2);
+    assert_eq!(scheduler.schedule(0.0).unwrap().len(), 2);
     let completed = scheduler.done_iteration(1.0);
     assert_eq!(
         completed.iter().map(|r| r.request_id).collect::<Vec<_>>(),
@@ -478,16 +482,16 @@ fn external_capacity_wait_allows_already_running_work() {
     let mut scheduler = scheduler(64, 64, 2, false);
     scheduler.configure_external_kv().unwrap();
     scheduler.enqueue_sub_request(request(0, 4, 3));
-    scheduler.schedule().unwrap();
+    scheduler.schedule(0.0).unwrap();
     scheduler.done_iteration(1.0);
     scheduler.enqueue_sub_request(request(1, 4, 1));
     scheduler.enqueue_sub_request(request(2, 4, 1));
     scheduler.set_external_admission_blocked(1, true);
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 4)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 4)]);
     assert_eq!(scheduler.observe()["hbm_admission_waiting_requests"], 2);
     assert!(scheduler.done_iteration(2.0).is_empty());
     scheduler.set_external_admission_blocked(1, false);
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(1, 5), (4, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(1, 5), (4, 0)]);
     let completed = scheduler.done_iteration(3.0);
     assert_eq!(
         completed.iter().map(|r| r.request_id).collect::<Vec<_>>(),
@@ -502,10 +506,10 @@ fn external_kv_preparation_can_be_skipped_without_bypassing_capacity() {
     scheduler.enqueue_sub_request(request(0, 4, 1));
     scheduler.enqueue_sub_request(request(1, 4, 1));
     scheduler.set_external_blocked(0, true);
-    assert_eq!(scheduler.schedule().unwrap().len(), 1);
+    assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
     assert_eq!(scheduler.done_iteration(1.0)[0].request_id, 1);
     scheduler.set_external_blocked(0, false);
-    assert_eq!(scheduler.schedule().unwrap().len(), 1);
+    assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
     assert_eq!(scheduler.done_iteration(2.0)[0].request_id, 0);
 }
 
@@ -515,17 +519,17 @@ fn failed_admission_does_not_refresh_the_prefix_free_queue() {
     complete_one(scheduler.as_mut(), proxy(0, "shared", &[1], 1), 1.0);
     complete_one(scheduler.as_mut(), proxy(1, "other", &[2], 1), 2.0);
     scheduler.enqueue_sub_request(request(2, 4, 13));
-    scheduler.schedule().unwrap();
+    scheduler.schedule(0.0).unwrap();
     scheduler.done_iteration(3.0);
     scheduler.enqueue_sub_request(proxy(3, "shared", &[1, 11, 12, 13, 14], 1));
     for step in 1..=12 {
-        assert_eq!(scheduler.schedule().unwrap().len(), 1);
+        assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
         let completed = scheduler.done_iteration(f64::from(step + 3));
         assert_eq!(completed.len(), usize::from(step == 12));
     }
     // Every failed admission probed block 1. It remained oldest, so running
     // growth reclaimed it instead of refreshing it ahead of the other prefix.
-    assert_eq!(shape(&scheduler.schedule().unwrap()), [(20, 0)]);
+    assert_eq!(shape(&scheduler.schedule(0.0).unwrap()), [(20, 0)]);
 }
 
 #[test]
@@ -536,17 +540,19 @@ fn recurrent_prefix_reuses_only_with_a_counted_state_checkpoint() {
         request.kv_prefix = Some(KvPrefix {
             namespace: "hybrid-model/layout/shared".into(),
             block_tokens: 4,
+            parent: None,
+            shared: 0,
             block_ids: vec![1, 2],
         });
         scheduler.enqueue_sub_request(request);
         if id == 0 {
-            let batch = scheduler.schedule().unwrap();
+            let batch = scheduler.schedule(0.0).unwrap();
             assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 0));
             assert!(scheduler.done_iteration(1.0).is_empty());
             // One attention block and one recurrent snapshot: 4 + 8 bytes.
             assert_eq!(scheduler.observe()["prefix_cache_bytes"], 12);
         }
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!((batch[0].q_len, batch[0].kv_len), (4, 4));
         assert!(scheduler.observe()["hbm_allocated_bytes"].as_u64().unwrap() <= 32);
         assert_eq!(scheduler.done_iteration(2.0 + id as f64).len(), 1);
@@ -563,16 +569,18 @@ fn recurrent_hit_stops_at_state_even_when_more_attention_kv_matches() {
         request.kv_prefix = Some(KvPrefix {
             namespace: "hybrid-model/layout/shared".into(),
             block_tokens: 4,
+            parent: None,
+            shared: 0,
             block_ids: blocks,
         });
         scheduler.enqueue_sub_request(request);
-        let batch = scheduler.schedule().unwrap();
+        let batch = scheduler.schedule(0.0).unwrap();
         assert_eq!(
             (batch[0].q_len, batch[0].kv_len),
             (4, if id == 0 { 0 } else { 4 })
         );
         assert!(scheduler.done_iteration(1.0 + id as f64 * 2.0).is_empty());
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         assert_eq!(scheduler.done_iteration(2.0 + id as f64 * 2.0).len(), 1);
     }
 }
@@ -582,7 +590,7 @@ fn external_occupancy_cannot_consume_reserved_lookahead() {
     let mut scheduler = stateful(16, 0, 4, false);
     scheduler.configure_external_kv().unwrap();
     scheduler.enqueue_sub_request(request(0, 4, 2));
-    scheduler.schedule().unwrap();
+    scheduler.schedule(0.0).unwrap();
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 8);
     // Eight private bytes include the still-uncomputed lookahead reservation.
     assert!(scheduler.set_external_kv_bytes(12).is_err());
@@ -593,9 +601,9 @@ fn external_occupancy_cannot_consume_reserved_lookahead() {
 fn lookahead_arithmetic_does_not_overflow_computed_progress() {
     let mut scheduler = stateful(1 << 40, 0, u32::MAX, false);
     scheduler.enqueue_sub_request(request(0, 1, 3));
-    scheduler.schedule().unwrap();
+    scheduler.schedule(0.0).unwrap();
     scheduler.done_iteration(1.0);
-    let next = scheduler.schedule().unwrap();
+    let next = scheduler.schedule(0.0).unwrap();
     assert_eq!((next[0].q_len, next[0].kv_len), (1, 1));
     // Allocation remains nonzero after adding lookahead to computed progress.
     assert!(scheduler.observe()["hbm_allocated_bytes"].as_u64().unwrap() >= 4);
@@ -607,9 +615,9 @@ fn pending_external_restore_prevents_compute_until_ready() {
     scheduler.configure_external_kv().unwrap();
     scheduler.enqueue_sub_request(request(0, 4, 2));
     scheduler.set_external_blocked(0, true);
-    assert!(scheduler.schedule().unwrap().is_empty());
+    assert!(scheduler.schedule(0.0).unwrap().is_empty());
     scheduler.set_external_blocked(0, false);
-    assert_eq!(scheduler.schedule().unwrap()[0].q_len, 4);
+    assert_eq!(scheduler.schedule(0.0).unwrap()[0].q_len, 4);
 }
 
 #[test]
@@ -636,7 +644,7 @@ fn external_progress_events_follow_completed_block_boundaries() {
     scheduler.enqueue_sub_request(request(0, 4, 9));
     let mut progress = Vec::new();
     for now in 1..=9 {
-        scheduler.schedule().unwrap();
+        scheduler.schedule(0.0).unwrap();
         scheduler.done_iteration(f64::from(now));
         progress.extend(scheduler.take_kv_progress());
     }
@@ -652,7 +660,7 @@ fn external_reclaim_retries_aggregate_batch_before_preempting() {
     for id in 0..3 {
         scheduler.enqueue_sub_request(request(id, 4, 2));
     }
-    assert!(scheduler.schedule().unwrap().is_empty());
+    assert!(scheduler.schedule(0.0).unwrap().is_empty());
     assert!(scheduler.external_reclaim_pending());
     assert_eq!(scheduler.external_kv_requirement().unwrap().1, 12);
     assert!(scheduler.take_external_preemptions().is_empty());
@@ -661,7 +669,7 @@ fn external_reclaim_retries_aggregate_batch_before_preempting() {
     scheduler.cancel_iteration();
     scheduler.set_external_kv_bytes(12).unwrap();
     scheduler.set_external_kv_reclaimable_bytes(12);
-    assert_eq!(scheduler.schedule().unwrap().len(), 3);
+    assert_eq!(scheduler.schedule(0.0).unwrap().len(), 3);
     assert!(!scheduler.external_reclaim_pending());
     assert_eq!(scheduler.observe()["hbm_allocated_bytes"], 24);
 }
@@ -675,14 +683,18 @@ fn external_wait_phases_are_disjoint_and_do_not_run_blocked_calls() {
     scheduler.set_external_admission_blocked(0, true);
     assert_eq!(scheduler.observe()["hbm_admission_waiting_requests"], 1);
     assert_eq!(scheduler.observe()["scheduler_waiting_requests"], 1);
+    // A pool call keeps its lookup while it waits for HBM: admission wins.
     scheduler.set_external_blocked(0, true);
-    assert_eq!(scheduler.observe()["hbm_admission_waiting_requests"], 0);
+    assert_eq!(scheduler.observe()["hbm_admission_waiting_requests"], 1);
+    assert_eq!(scheduler.observe()["kv_preparation_waiting_requests"], 0);
+    scheduler.set_external_admission_blocked(0, false);
     assert_eq!(scheduler.observe()["kv_preparation_waiting_requests"], 1);
     assert_eq!(scheduler.observe()["scheduler_waiting_requests"], 1);
+    scheduler.set_external_admission_blocked(0, true);
     scheduler.set_external_blocked(0, false);
-    assert!(scheduler.schedule().unwrap().is_empty());
+    assert!(scheduler.schedule(0.0).unwrap().is_empty());
     scheduler.set_external_admission_blocked(0, false);
-    assert_eq!(scheduler.schedule().unwrap().len(), 2);
+    assert_eq!(scheduler.schedule(0.0).unwrap().len(), 2);
     scheduler.done_iteration(1.0);
     assert_eq!(scheduler.take_kv_progress(), [(0, 4), (1, 4)]);
 }

@@ -7,20 +7,27 @@ private KV allocation. Tools retain their native DAG timing.
 
 An ordered prefix identity is independent of session membership, execution
 references, and storage locations. Native `kv_prefix` namespaces identify source
-content and sharing scope; physical model/layout fingerprints check compatibility.
+content and sharing scope; token traces identify input and traced output in one
+pool-wide scope. Physical model/layout fingerprints check compatibility.
 Equal token counts, session IDs, or DAG edges never establish content identity.
 Computed blocks without supplied identity receive request-local keys, created at
-compute completion. Every reuse starts at the longest available continuous prefix;
-missing suffixes are prefetched or recomputed. The final sampled token has no KV.
+compute completion. Every reuse starts at the longest available continuous prefix
+of the scheduler's known tokens but the last, so a resumed call also reuses and
+reserves its generated tokens; missing suffixes are prefetched or recomputed.
+The final sampled token has no KV.
 
 Released calls without an explicit binding choose a worker by `routing`.
-`vllm_dp` (default) follows vLLM's data-parallel load balancer (`DPLBAsyncMPClient`,
+`least_loaded` (default) follows vLLM's data-parallel load balancer (`DPLBAsyncMPClient`,
 commit `ce72586f`): a 100 ms snapshot of waiting (queued or preparing KV) and
 running calls plus KV usage, where unreferenced cached blocks count as free;
 score `max(in-flight, waiting + running)`, plus `6 · waiting · max(0, usage − 0.5)`;
-a rotating scan start; and a local waiting increment per choice. `session_hash`
+a rotating scan start; and a local waiting increment per choice. `session`
 pins each session to a stable hash, as in vLLM production-stack session routing,
-and falls back to `vllm_dp` without a session.
+and falls back to `least_loaded` without a session. `cache_affinity` follows production-stack's
+`LoadAwareRouter` (commit `2f879ef8`): matched-prefix fraction minus β times
+relative in-flight load. As in LMCache's controller lookup, the prompt's blocks
+are walked until one is in no host DRAM, and a worker's match ends at the last
+block of that run in its own host DRAM; with no match anywhere it routes by session.
 
 Explicit `calls` bindings remain diagnostic fixtures. `blocks` specifies a full
 ordered prefix, `completed_blocks` supplies computed identities, and
@@ -28,8 +35,22 @@ ordered prefix, `completed_blocks` supplies computed identities, and
 Inconsistent prefix order is rejected. Pool blocks may group complete source identity blocks; smaller or
 incommensurate blocks conservatively miss. Model payload sizes are derived per physical rank;
 explicit single-rank proxy byte sizes remain available for controlled fixtures.
-TP has one physical part per rank, including replicated KV heads. EP has one
+TP has one physical part per rank, including replicated KV heads. A block's
+parts share one directory entry for its position and session membership; each
+part keeps its own copies, LRU position, pending transfer and pins. EP has one
 part on the chosen attention rank; aggregate EP cannot provide stable ownership.
+
+Outside HBM a block has one copy: its computing worker's host DRAM, a CXL
+device after a spill, or none after eviction. A call gathers each block from its
+own GPU's HBM or from that copy, local or remote; other GPUs' HBM is no source.
+Reuse ends at the first block found nowhere, because vLLM keeps one computed-token
+count per request. As in vLLM, a released call joins its worker's queue at once
+and loads its prefix only at its turn, in queue order, while a running slot and
+token budget remain (or always, up to `max_num_inflight_kv_loads`), and only if
+HBM can then hold the prefix and the rest of the prompt; the scheduler holds those bytes until
+admission, and a call that cannot fit holds nothing and blocks later ones.
+Preempted calls reload at their next turn. Other calls run while a prefix loads. A reused block whose copy was evicted during the call is
+stored again at its end.
 
 Full-block compute notifications transfer HBM accounting from the scheduler to
 the directory and initiate asynchronous HBM-to-host stores. This follows the
@@ -37,7 +58,7 @@ full-chunk, `ON_COMPUTE` trigger in vLLM V1's OffloadingConnector, pinned to com
 `b7e43db256a69b8c2917e5ef4cf8073a086187eb`. Stores preserve the HBM source. Reloads
 preserve backing copies. A valid host or CXL copy suppresses duplicate stores;
 a reserved destination is never a cache hit. Pending stores and transfers protect
-the source until publication. Request completion releases execution references;
+only their source until publication; other copies stay reclaimable. Request completion releases execution references;
 the last node in each source session removes membership without deleting cached
 data, independently of sibling sessions. Scoped tool and end nodes preserve trailing
 session lifetimes. Native DAGs containing unscoped tools conservatively retain
@@ -57,12 +78,16 @@ hierarchy. HBM reclamation is separate from storage and occurs only when the nex
 allocation needs capacity. Each store maintains free extents and a reclaimable
 LRU index. A reservation may use multiple disjoint extents; artificial contiguous
 address requirements never prevent an otherwise feasible allocation. Reload
-admission also accounts for the worker scheduler's current private reservations. Active HBM copies and the last CXL source awaiting a reload remain pinned.
+admission also accounts for the worker scheduler's current private reservations. A consumer pins only
+its own rank's HBM copy, so other workers' idle copies stay reclaimable; the last last-tier
+source awaiting a reload also remains pinned.
 Independent backing copies can be reclaimed safely. A sole pinned host source
 may still spill because publication precedes source release. Host pressure spills reclaimable host copies to CXL;
 CXL pressure deletes reclaimable cache copies in tier-wide LRU order. Placement
 tries free compatible devices before eviction and skips devices too small for
-the payload. A payload that fits no CXL device is rejected explicitly. There is no completed
+the payload. A payload that fits no CXL device is rejected explicitly. With no
+placement devices, host DRAM is the last tier: host pressure deletes reclaimable
+host copies in LRU order, as vLLM CPU offloading does. There is no completed
 session priority or TTL. Per-host store queues stop at capacity dependencies
 without repeatedly scanning their backlog.
 
@@ -81,9 +106,8 @@ space. Configured routes must support both HBM-to-host stores and reloads.
 Collectives retain worker-local fabrics; shared collective/CXL contention and
 predictive tool-latency policies are outside this model.
 
-Default observations contain aggregate block/transfer counters, tier occupancy,
-and admission/KV preparation gauges counted from released LLM calls. Future
-request DAGs and completed cache entries are not scanned for wait gauges.
+Default observations contain aggregate block/transfer counters and tier
+occupancy; wait gauges come from the worker schedulers, where released calls wait.
 `detailed_observations = true` records transfer/event history and additionally
 serializes the directory, physical extents, pins, membership, reservations,
 and topology. Default mode retains no event or transfer history.

@@ -33,9 +33,13 @@ A completed node releases its children and is removed. The run ends when no
 node is ready; any node left in the graph means a cycle or an orphan, and the
 run fails.
 
-A network poll answers either complete or pending with a delay. A pending node
-requeues itself after that delay, which lets concurrent transfers change each
-other's rates. Polls reach a simulator in nondecreasing time, so it may advance
+A network poll answers complete, pending with a delay, or deferred. A pending
+node requeues itself after that delay. After each poll the simulator may name
+pending nodes to poll earlier, because concurrent transfers change each
+other's rates; the engine requeues them and drops their superseded entries. A
+deferred node is polled again at the same time after every other event there,
+so a simulator can register simultaneous transfers before answering any of
+them. Polls reach a simulator in nondecreasing time, so it may advance
 its own clock lazily.
 
 ## Graph Mutation

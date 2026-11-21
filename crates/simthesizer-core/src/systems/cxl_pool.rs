@@ -1,14 +1,17 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
+use std::rc::Rc;
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Graph;
 use crate::module::{LogicalHandler, Module};
 use crate::network_sims::topology::{Topology, TopologyNetwork};
 use crate::scheduler::KvMemoryInfo;
+use crate::schedulers::prefix_cache::hash_block;
 use crate::system::{System, SystemEvent};
 use crate::types::{InstanceLoad, NodeID, Request, RequestResult, ResultSubRequest, SubRequest};
 
@@ -26,16 +29,24 @@ enum Routing {
     /// vLLM data-parallel load balancing (`DPLBAsyncMPClient`, commit
     /// ce72586f8aded8dafa7d4c745a5cef3198070e3e).
     #[default]
-    VllmDp,
+    LeastLoaded,
     /// Stable hash of the session ID, as in vLLM production-stack session
-    /// routing; calls without a session fall back to `vllm_dp`.
-    SessionHash,
+    /// routing; calls without a session fall back to `least_loaded`.
+    Session,
+    /// vLLM production-stack `LoadAwareRouter` (commit
+    /// 2f879ef8a7c21f975ac0b2675267b7ba681b2cfa of `routing_logic.py`): KV-cache
+    /// affinity weighted by in-flight load; see `cache_affinity_choice`.
+    CacheAffinity,
+}
+
+fn default_beta() -> f64 {
+    1.0
 }
 
 /// One frontend: load is the larger of this client's in-flight calls and the
 /// snapshot's waiting + running; waiting is penalized from 50% KV usage. The
 /// scan starts at a rotating index and the first strict minimum wins.
-fn vllm_dp_choice(snapshot: &[(f64, f64, f64)], inflight: &[u64], start: usize) -> usize {
+fn least_loaded_choice(snapshot: &[(f64, f64, f64)], inflight: &[u64], start: usize) -> usize {
     let mut best = (f64::INFINITY, 0);
     for i in 0..snapshot.len() {
         let index = (start + i) % snapshot.len();
@@ -51,11 +62,10 @@ fn vllm_dp_choice(snapshot: &[(f64, f64, f64)], inflight: &[u64], start: usize) 
     best.1
 }
 
+/// A configured call placement; its block names are interned at init.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CallBinding {
-    #[serde(skip)]
-    automatic: bool,
+struct CallConfig {
     request_id: u64,
     subrequest_index: usize,
     worker: usize,
@@ -65,6 +75,58 @@ struct CallBinding {
     completed_blocks: Vec<String>,
     #[serde(default)]
     seed_host_blocks: Vec<String>,
+}
+
+#[derive(Clone)]
+struct CallBinding {
+    automatic: bool,
+    subrequest_index: usize,
+    worker: usize,
+    blocks: Vec<Name>,
+    completed_blocks: Vec<Name>,
+    seed_host_blocks: Vec<Name>,
+}
+
+/// Dense IDs for strings, in first-seen order; each string is stored once.
+#[derive(Default)]
+struct Interner {
+    names: Vec<Rc<str>>,
+    ids: HashMap<Rc<str>, u64>,
+}
+impl Interner {
+    fn intern(&mut self, name: &str) -> u64 {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = self.names.len() as u64;
+        let name: Rc<str> = name.into();
+        self.names.push(name.clone());
+        self.ids.insert(name, id);
+        id
+    }
+}
+
+/// A small set in an exactly sized slice. An emptied `BTreeSet` keeps its
+/// node, and every block keeps its sets for its whole life.
+#[derive(Debug, Default)]
+struct SmallSet<T>(Box<[T]>);
+impl<T: Copy + PartialEq> SmallSet<T> {
+    fn insert(&mut self, value: T) {
+        if !self.0.contains(&value) {
+            self.0 = self.0.iter().copied().chain([value]).collect();
+        }
+    }
+    fn retain(&mut self, keep: impl Fn(&T) -> bool) {
+        if !self.0.iter().all(&keep) {
+            self.0 = self.0.iter().copied().filter(|value| keep(value)).collect();
+        }
+    }
+    fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -105,10 +167,22 @@ pub struct CxlPoolSystem {
     max_outstanding_reads: usize,
     #[serde(default)]
     routing: Routing,
+    /// `cache_affinity` weight on relative load, in full cache hits per 100% above
+    /// the fleet mean (production-stack `DEFAULT_LOADAWARE_BETA`).
+    #[serde(default = "default_beta")]
+    affinity_beta: f64,
     #[serde(default)]
-    calls: Vec<CallBinding>,
+    calls: Vec<CallConfig>,
+    /// `calls` with interned names, indexed by `binding_index`.
+    #[serde(skip)]
+    configured: Vec<CallBinding>,
     #[serde(skip)]
     binding_index: BTreeMap<(u64, usize), usize>,
+    /// Logical block names; see `Name`.
+    #[serde(skip)]
+    block_names: Interner,
+    #[serde(skip)]
+    session_names: Interner,
     #[serde(default)]
     pressures: Vec<Pressure>,
     #[serde(default)]
@@ -117,6 +191,14 @@ pub struct CxlPoolSystem {
     fabric: Option<TopologyNetwork>,
     #[serde(skip)]
     memory: Vec<Vec<KvMemoryInfo>>,
+    /// Hosts in `host_capacity_bytes` order; `Location::Host` indexes them.
+    #[serde(skip)]
+    host_names: Vec<String>,
+    /// Distinct KV geometries, and each worker rank's index into them.
+    #[serde(skip)]
+    geometries: Vec<(u64, u64, u64)>,
+    #[serde(skip)]
+    rank_geometry: Vec<Vec<u32>>,
     #[serde(skip)]
     active: BTreeMap<u64, Active>,
     #[serde(skip)]
@@ -126,7 +208,7 @@ pub struct CxlPoolSystem {
     #[serde(skip)]
     next_child: u64,
     #[serde(skip)]
-    blocks: BTreeMap<BlockKey, Block>,
+    blocks: Directory,
     #[serde(skip)]
     next_block: u64,
     #[serde(skip)]
@@ -142,17 +224,19 @@ pub struct CxlPoolSystem {
     #[serde(skip)]
     results: Vec<RequestResult>,
     #[serde(skip)]
+    first_token_waits: (u64, f64),
+    #[serde(skip)]
     observations: Vec<serde_json::Value>,
     #[serde(skip)]
     host_bytes_freed: u64,
     #[serde(skip)]
-    stores: BTreeMap<StoreId, Store>,
+    stores: HashMap<StoreId, Store, BuildHasherDefault<KeyHasher>>,
     #[serde(skip)]
-    session_blocks: BTreeMap<(u64, String), BTreeSet<BlockKey>>,
+    session_blocks: BTreeMap<(u64, Session), BTreeSet<Name>>,
     #[serde(skip)]
     child_placement: BTreeMap<u64, (usize, Vec<usize>)>,
     #[serde(skip)]
-    pending_stores: BTreeMap<String, VecDeque<BlockKey>>,
+    pending_stores: BTreeMap<u32, VecDeque<BlockKey>>,
     #[serde(skip)]
     queued_stores: BTreeSet<BlockKey>,
     /// Per worker (waiting, running, KV usage) as of `lb_refreshed`.
@@ -170,17 +254,18 @@ pub struct CxlPoolSystem {
 
 crate::register_system!(CxlPoolSystem, "cxl_pool");
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "tier", rename_all = "snake_case")]
+/// A copy's store and allocation handle. `node` indexes `host_names` and
+/// `device` indexes `placement_devices`, so a copy owns no heap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Location {
     Host {
-        node: String,
+        node: u32,
         worker: usize,
         rank: usize,
         offset: u64,
     },
     Pool {
-        device: String,
+        device: u32,
         offset: u64,
     },
     Hbm {
@@ -190,21 +275,45 @@ enum Location {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum StoreId {
-    Host(String),
-    Pool(String),
+    Host(u32),
+    Pool(u32),
     Hbm(usize, usize),
+}
+/// Fx hash for directory keys; SipHash dominated directory updates.
+#[derive(Default)]
+struct KeyHasher(u64);
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        bytes.iter().for_each(|&byte| self.write_u64(byte.into()));
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
 }
 #[derive(Default)]
 struct Store {
     free: BTreeMap<u64, u64>,
-    allocations: BTreeMap<u64, Vec<(u64, u64)>>,
+    /// Extents of fragmented allocations; a contiguous one is `(handle, bytes)`.
+    allocations: BTreeMap<u64, Box<[(u64, u64)]>>,
     capacity: u64,
     used: u64,
-    reclaimable: BTreeSet<(u64, BlockKey)>,
+    /// Reclaimable copies in LRU order. A touch only advances `Block::ordinal`;
+    /// `CxlPoolSystem::oldest` re-keys stale copies once they reach the front.
+    reclaimable: BTreeMap<u64, BlockKey>,
+    /// Each reclaimable copy's key in `reclaimable`.
+    reclaimable_ordinals: HashMap<BlockKey, u64, BuildHasherDefault<KeyHasher>>,
     reclaimable_bytes: u64,
     pending: BTreeSet<NodeID>,
+    /// Usage changed since the owning worker last saw it.
+    dirty: bool,
 }
 impl Store {
     fn new(capacity: u64) -> Self {
@@ -232,19 +341,45 @@ impl Store {
             remaining -= taken;
         }
         self.used += bytes;
-        assert!(self.allocations.insert(handle, extents).is_none());
+        self.dirty = true;
+        if extents.len() > 1 {
+            assert!(self
+                .allocations
+                .insert(handle, extents.into_boxed_slice())
+                .is_none());
+        }
         Some(handle)
+    }
+    fn extents(&self, handle: u64, bytes: u64) -> Box<[(u64, u64)]> {
+        (self.allocations.get(&handle).cloned()).unwrap_or_else(|| Box::new([(handle, bytes)]))
     }
     fn release(&mut self, handle: u64, bytes: u64) {
         let extents = self
             .allocations
             .remove(&handle)
-            .expect("unknown storage allocation");
+            .unwrap_or_else(|| Box::new([(handle, bytes)]));
         assert_eq!(extents.iter().map(|(_, size)| *size).sum::<u64>(), bytes);
         self.used -= bytes;
-        for (offset, size) in extents {
+        self.dirty = true;
+        for &(offset, size) in &extents {
             self.release_extent(offset, size);
         }
+    }
+    fn set_reclaimable(&mut self, key: &BlockKey, ordinal: u64, bytes: u64, reclaimable: bool) {
+        use std::collections::hash_map::Entry;
+        match (self.reclaimable_ordinals.entry(*key), reclaimable) {
+            (Entry::Vacant(entry), true) => {
+                entry.insert(ordinal);
+                self.reclaimable.insert(ordinal, *key);
+                self.reclaimable_bytes += bytes;
+            }
+            (Entry::Occupied(entry), false) => {
+                self.reclaimable.remove(&entry.remove());
+                self.reclaimable_bytes -= bytes;
+            }
+            _ => return,
+        }
+        self.dirty = true;
     }
     fn release_extent(&mut self, mut offset: u64, mut bytes: u64) {
         if let Some((&previous, &size)) = self.free.range(..offset).next_back() {
@@ -263,8 +398,8 @@ impl Store {
 impl Location {
     fn store(&self) -> StoreId {
         match self {
-            Self::Host { node, .. } => StoreId::Host(node.clone()),
-            Self::Pool { device, .. } => StoreId::Pool(device.clone()),
+            Self::Host { node, .. } => StoreId::Host(*node),
+            Self::Pool { device, .. } => StoreId::Pool(*device),
             Self::Hbm { worker, rank, .. } => StoreId::Hbm(*worker, *rank),
         }
     }
@@ -317,41 +452,149 @@ impl Location {
     }
 }
 
-type BlockKey = (String, usize);
+/// Interned block name: a logical block's ID doubled, plus one for its
+/// recurrent checkpoint. IDs only identify blocks; eviction order comes from
+/// `Block::ordinal`.
+type Name = u64;
+/// A block's name and physical part.
+type BlockKey = (Name, usize);
+type Session = u64;
 
-struct Block {
+/// One physical part of a cached block. Parts keep their own copies, LRU
+/// position and pins: transfers finish per part, and a pin names its rank.
+struct Part {
     bytes: u64,
-    recurrent: bool,
-    geometry: (u64, u64, u64),
-    index: u64,
+    /// Index into `geometries`.
+    geometry: u32,
     location: Location,
-    replicas: Vec<Location>,
-    sessions: BTreeSet<(String, u64)>,
+    /// Exactly sized: a part rarely has more than two copies.
+    replicas: Box<[Location]>,
     ordinal: u64,
-    pending: Option<(Location, NodeID)>,
-    pins: BTreeSet<u64>,
+    /// Boxed: only parts in transfer have one.
+    pending: Option<Box<(Location, NodeID)>>,
+    /// Consuming child -> the HBM (worker, rank) whose copy it uses.
+    pins: SmallSet<(u64, (usize, usize))>,
+}
+impl Part {
+    fn add_replica(&mut self, copy: Location) {
+        self.replicas = self.replicas.iter().copied().chain([copy]).collect();
+    }
+    fn take_replica(&mut self, index: usize) -> Location {
+        let copy = self.replicas[index];
+        self.replicas = (self.replicas.iter().enumerate())
+            .filter(|&(i, _)| i != index)
+            .map(|(_, &copy)| copy)
+            .collect();
+        copy
+    }
+}
+/// What a cached block's parts share: its prefix position and session
+/// membership. It is cached while any part is.
+struct Block {
+    index: u64,
+    sessions: SmallSet<(Session, u64)>,
+    parts: Box<[Option<Part>]>,
+}
+/// Cached blocks, one entry each, addressed by part; the directory's size is
+/// set by the cache, so a part costs no map entry of its own.
+#[derive(Default)]
+struct Directory {
+    blocks: BTreeMap<Name, Block>,
+    parts: usize,
+}
+impl Directory {
+    fn get(&self, key: &BlockKey) -> Option<&Part> {
+        self.blocks.get(&key.0)?.parts.get(key.1)?.as_ref()
+    }
+    fn get_mut(&mut self, key: &BlockKey) -> Option<&mut Part> {
+        self.blocks.get_mut(&key.0)?.parts.get_mut(key.1)?.as_mut()
+    }
+    fn contains_key(&self, key: &BlockKey) -> bool {
+        self.get(key).is_some()
+    }
+    fn block(&self, name: Name) -> &Block {
+        &self.blocks[&name]
+    }
+    fn block_mut(&mut self, name: Name) -> &mut Block {
+        self.blocks.get_mut(&name).unwrap()
+    }
+    /// Adds a part; a new block has room for `parts` parts at `index`.
+    fn insert(&mut self, key: BlockKey, parts: usize, index: u64, part: Part) {
+        let block = self.blocks.entry(key.0).or_insert_with(|| Block {
+            index,
+            sessions: SmallSet::default(),
+            parts: (0..parts.max(key.1 + 1)).map(|_| None).collect(),
+        });
+        if key.1 >= block.parts.len() {
+            let mut grown = std::mem::take(&mut block.parts).into_vec();
+            grown.resize_with(key.1 + 1, || None);
+            block.parts = grown.into_boxed_slice();
+        }
+        assert!(
+            block.parts[key.1].replace(part).is_none(),
+            "duplicate block part"
+        );
+        self.parts += 1;
+    }
+    /// Removes a part, and its block once no part remains.
+    fn remove(&mut self, key: &BlockKey) -> Option<Block> {
+        let block = self.blocks.get_mut(&key.0).unwrap();
+        block.parts[key.1].take().unwrap();
+        self.parts -= 1;
+        if block.parts.iter().all(Option::is_none) {
+            self.blocks.remove(&key.0)
+        } else {
+            None
+        }
+    }
+    fn len(&self) -> usize {
+        self.parts
+    }
+    fn iter(&self) -> impl Iterator<Item = (BlockKey, &Block, &Part)> {
+        self.blocks.iter().flat_map(|(&name, block)| {
+            (block.parts.iter().enumerate())
+                .filter_map(move |(index, part)| Some(((name, index), block, part.as_ref()?)))
+        })
+    }
+}
+impl std::ops::Index<&BlockKey> for Directory {
+    type Output = Part;
+    fn index(&self, key: &BlockKey) -> &Part {
+        self.get(key).expect("unknown block part")
+    }
 }
 struct Active {
     request: Request,
     sink: Option<*mut dyn LogicalHandler>,
     completion: Vec<NodeID>,
-    results: Vec<Option<ResultSubRequest>>,
+    /// Boxed: most sub-requests are still pending.
+    results: Vec<Option<Box<ResultSubRequest>>>,
     completed: Vec<bool>,
     calls: BTreeMap<usize, CallState>,
-    session_calls: BTreeMap<String, usize>,
+    /// Session of each sub-request.
+    sessions: Vec<Session>,
+    session_calls: BTreeMap<Session, usize>,
     conservative_sessions: bool,
 }
 struct CallState {
     binding: CallBinding,
     child: u64,
     released: f64,
+    /// When the prefix first finished loading and the call became schedulable.
     ready: Option<f64>,
-    enqueue: NodeID,
+    /// Queued for its turn to look up its prefix.
+    pending: bool,
+    /// Fires once the prefix being loaded has arrived.
+    loaded: Option<NodeID>,
+    load_started: f64,
     ranks: Vec<usize>,
-    reads: VecDeque<BlockKey>,
-    /// Outstanding reads per physical part; each rank loads its own shard.
-    inflight: BTreeMap<usize, usize>,
+    /// Unissued reads per physical part, in prefix order; each rank loads its own shard.
+    reads: Vec<VecDeque<BlockKey>>,
+    /// Outstanding reads per physical part.
+    inflight: Vec<usize>,
     restored_blocks: usize,
+    /// Tokens restored when the prefix first loaded.
+    reused_tokens: Option<u32>,
     published_blocks: usize,
     owned_keys: BTreeSet<(u64, BlockKey)>,
     checkpoint_source: Option<(u32, Vec<BlockKey>)>,
@@ -361,7 +604,6 @@ struct CallState {
     admission_waiting: bool,
     admission_barrier: Option<NodeID>,
     preempted: bool,
-    resume: Option<NodeID>,
 }
 struct PressureState {
     config: Pressure,
@@ -402,7 +644,7 @@ enum Event {
         request: u64,
         index: usize,
     },
-    Enqueue {
+    Loaded {
         request: u64,
         index: usize,
     },
@@ -412,11 +654,6 @@ enum Event {
         call: Option<(u64, usize)>,
         source: Location,
         release_source: bool,
-    },
-    Resume {
-        request: u64,
-        index: usize,
-        continuation: NodeID,
     },
     Capacity {
         child: u64,
@@ -441,9 +678,9 @@ impl CxlPoolSystem {
     fn fabric(&self) -> &TopologyNetwork {
         self.fabric.as_ref().unwrap()
     }
-    fn binding(&self, request: u64, index: usize) -> CallBinding {
+    fn binding(&mut self, request: u64, index: usize) -> CallBinding {
         if let Some(&binding) = self.binding_index.get(&(request, index)) {
-            let mut binding = self.calls[binding].clone();
+            let mut binding = self.configured[binding].clone();
             if binding.completed_blocks.is_empty() && binding.seed_host_blocks.is_empty() {
                 binding.completed_blocks = binding.blocks.clone();
             }
@@ -451,25 +688,26 @@ impl CxlPoolSystem {
         }
         let mut binding = CallBinding {
             automatic: true,
-            request_id: request,
             subrequest_index: index,
             worker: 0,
             blocks: vec![],
             completed_blocks: vec![],
             seed_host_blocks: vec![],
         };
+        let mut names = Vec::new();
+        let mut restorable = 0;
+        let active = self.active.get(&request);
         if let Some(SubRequest::Llm {
             input_tokens,
-            kv_prefix,
+            output_tokens,
+            input_token_ids,
+            output_token_ids,
             ..
-        }) = self
-            .active
-            .get(&request)
-            .and_then(|active| active.request.sub_requests.get(index))
+        }) = active.and_then(|active| active.request.sub_requests.get(index))
         {
-            if let Some(prefix) = kv_prefix {
+            let mut previous = 0u64;
+            if let Some(prefix) = active.unwrap().request.resolved_kv_prefix(index) {
                 use std::hash::{Hash, Hasher};
-                let mut previous = 0u64;
                 let group = if self.block_tokens.is_multiple_of(prefix.block_tokens) {
                     (self.block_tokens / prefix.block_tokens) as usize
                 } else {
@@ -481,22 +719,43 @@ impl CxlPoolSystem {
                     self.block_tokens.hash(&mut hash);
                     ids.hash(&mut hash);
                     previous = hash.finish();
-                    binding
-                        .completed_blocks
-                        .push(format!("{}:{previous:016x}", prefix.namespace));
+                    names.push(format!("{}:{previous:016x}", prefix.namespace));
                 }
-                binding.blocks = binding
-                    .completed_blocks
-                    .iter()
-                    .take((input_tokens.saturating_sub(1) / self.block_tokens) as usize)
-                    .cloned()
-                    .collect();
+            } else if let Some(input) = input_token_ids {
+                // A token trace identifies its computed KV: the input and any
+                // traced output but the last sampled token.
+                let output = output_token_ids.as_deref().unwrap_or_default();
+                let computed = (input_tokens + output_tokens.saturating_sub(1)) as usize;
+                let tokens: Vec<u32> = input.iter().chain(output).take(computed).copied().collect();
+                for block in tokens.chunks_exact(self.block_tokens as usize) {
+                    previous = hash_block(previous, block, &[]);
+                    names.push(format!("tokens:{previous:016x}"));
+                }
             }
+            restorable = (input_tokens.saturating_sub(1) / self.block_tokens) as usize;
         }
+        binding.completed_blocks = names.iter().map(|name| self.block_name_id(name)).collect();
+        binding.blocks = binding
+            .completed_blocks
+            .iter()
+            .take(restorable)
+            .copied()
+            .collect();
         binding
     }
-    /// vLLM counts queued, preparing and resumed requests as waiting and
-    /// admitted ones as running.
+    fn block_name_id(&mut self, name: &str) -> Name {
+        self.block_names.intern(name) << 1
+    }
+    fn block_name(&self, name: Name) -> String {
+        let logical = &*self.block_names.names[(name >> 1) as usize];
+        if name & 1 == 1 {
+            format!("{logical}:recurrent-state")
+        } else {
+            logical.to_owned()
+        }
+    }
+    /// vLLM counts queued requests, including those loading external KV, as
+    /// waiting and admitted ones as running.
     fn load_snapshot(&self, worker: usize) -> Result<(f64, f64, f64)> {
         let state = self.instances[worker].observe();
         let (waiting, running) = match (
@@ -509,10 +768,6 @@ impl CxlPoolSystem {
                 (load.waiting_requests as u64, load.running_requests as u64)
             }
         };
-        let preparing = self
-            .active_calls()
-            .filter(|call| call.binding.worker == worker && call.ready.is_none())
-            .count() as u64;
         // vLLM usage counts referenced blocks; unreferenced cached blocks are free.
         let mut kv_usage: f64 = 0.0;
         for (rank, memory) in self.memory[worker].iter().enumerate() {
@@ -526,13 +781,75 @@ impl CxlPoolSystem {
             let pinned = store.used.saturating_sub(store.reclaimable_bytes);
             kv_usage = kv_usage.max((private + pinned) as f64 / memory.capacity_bytes as f64);
         }
-        Ok(((waiting + preparing) as f64, running as f64, kv_usage))
+        Ok((waiting as f64, running as f64, kv_usage))
     }
-    fn route(&mut self, request: u64, index: usize, now: f64) -> Result<usize> {
+    /// production-stack `LoadAwareRouter`: worker `i` scores
+    /// `min(matched_i, prompt) / prompt - beta * (inflight_i - mean) / max(1, mean)`.
+    /// As in LMCache's controller `lookup` (commit
+    /// 3f7c2017b1d52ed7c1f00fee9a57936080725dac), the prefix is walked block by block
+    /// until a block has no copy in any host DRAM, and each host's `matched` is
+    /// the end of the last block it holds in that run; the shared pool belongs
+    /// to no instance. The first maximum wins; with no match anywhere, the
+    /// router falls back to session routing.
+    fn cache_affinity_choice(
+        &self,
+        request: u64,
+        index: usize,
+        blocks: &[Name],
+    ) -> Result<Option<usize>> {
+        let SubRequest::Llm { input_tokens, .. } =
+            &self.active[&request].request.sub_requests[index]
+        else {
+            unreachable!()
+        };
+        let mut matched = HashMap::new();
+        'prefix: for (position, &name) in blocks.iter().enumerate() {
+            let mut node = None;
+            for part in 0..self.memory[0].len() {
+                match self.blocks.get(&(name, part)).and_then(Self::offload_copy) {
+                    Some(&Location::Host { node: n, .. }) if node.is_none_or(|m| m == n) => {
+                        node = Some(n)
+                    }
+                    _ => break 'prefix,
+                }
+            }
+            matched.insert(
+                node.unwrap(),
+                (position as u64 + 1) * u64::from(self.block_tokens),
+            );
+        }
+        if matched.is_empty() {
+            return Ok(None);
+        }
+        let workers = self.instances.len();
+        let mean = self.inflight_calls.iter().sum::<u64>() as f64 / workers as f64;
+        let prompt = u64::from(*input_tokens);
+        let mut best = (f64::NEG_INFINITY, 0);
+        for worker in 0..workers {
+            let node = self.host_of(worker, 0)?;
+            let hit = node
+                .and_then(|node| matched.get(&node))
+                .map_or(0.0, |&tokens: &u64| {
+                    tokens.min(prompt) as f64 / prompt.max(1) as f64
+                });
+            let load = (self.inflight_calls[worker] as f64 - mean) / mean.max(1.0);
+            let score = hit - self.affinity_beta * load;
+            if score > best.0 {
+                best = (score, worker);
+            }
+        }
+        Ok(Some(best.1))
+    }
+    fn route(&mut self, request: u64, index: usize, blocks: &[Name], now: f64) -> Result<usize> {
         let workers = self.instances.len();
         let session = self.active[&request].request.sub_requests[index].session_id();
-        let worker = match (self.routing, session) {
-            (Routing::SessionHash, Some(session)) => {
+        let affine = match self.routing {
+            Routing::CacheAffinity => self.cache_affinity_choice(request, index, blocks)?,
+            _ => None,
+        };
+        let worker = match (self.routing, session, affine) {
+            (_, _, Some(worker)) => worker,
+            (Routing::Session | Routing::CacheAffinity, Some(session), _) => {
                 use std::hash::{Hash, Hasher};
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 session.hash(&mut hash);
@@ -548,7 +865,8 @@ impl CxlPoolSystem {
                         .collect::<Result<_>>()?;
                     self.lb_refreshed = Some(now);
                 }
-                let worker = vllm_dp_choice(&self.lb_snapshot, &self.inflight_calls, self.lb_start);
+                let worker =
+                    least_loaded_choice(&self.lb_snapshot, &self.inflight_calls, self.lb_start);
                 self.lb_snapshot[worker].0 += 1.0;
                 self.lb_start = (self.lb_start + 1) % workers;
                 worker
@@ -558,78 +876,104 @@ impl CxlPoolSystem {
         self.routed.insert((request, index), worker);
         Ok(worker)
     }
-    fn session(&self, request: u64, index: usize) -> (String, u64) {
-        (
-            self.active[&request].request.sub_requests[index]
-                .session_id()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("request:{request}")),
-            request,
-        )
+    fn session(&self, request: u64, index: usize) -> (Session, u64) {
+        (self.active[&request].sessions[index], request)
     }
     fn capacity(&self, location: &Location) -> Result<u64> {
-        match location {
-            Location::Host { node, .. } => self
-                .host_capacity_bytes
-                .get(node)
-                .copied()
-                .ok_or_else(|| anyhow!("missing host capacity for {node}")),
-            Location::Pool { device, .. } => self.fabric().memory_capacity(device),
-            Location::Hbm { worker, rank, .. } => Ok(self
-                .memory
-                .get(*worker)
-                .and_then(|ranks| ranks.get(*rank))
-                .ok_or_else(|| anyhow!("invalid worker/rank {worker}/{rank}"))?
-                .capacity_bytes),
-        }
+        self.stores
+            .get(&location.store())
+            .map(|store| store.capacity)
+            .ok_or_else(|| anyhow!("unknown KV store {location:?}"))
+    }
+    fn host_index(&self, node: &str) -> Option<u32> {
+        self.host_names
+            .binary_search_by(|name| name.as_str().cmp(node))
+            .ok()
+            .map(|index| index as u32)
+    }
+    /// The host DRAM of a worker rank's node, if it has KV capacity.
+    fn host_of(&self, worker: usize, rank: usize) -> Result<Option<u32>> {
+        Ok(self.host_index(&self.fabric().worker_rank(worker, rank)?.node))
     }
     fn used(&self, location: &Location) -> u64 {
         self.stores
             .get(&location.store())
             .map_or(0, |store| store.used)
     }
-    fn locations(block: &Block) -> impl Iterator<Item = &Location> {
-        std::iter::once(&block.location).chain(&block.replicas)
+    fn locations(block: &Part) -> impl Iterator<Item = &Location> {
+        std::iter::once(&block.location).chain(block.replicas.iter())
+    }
+    /// The block's one copy outside HBM, in some host DRAM or the pool.
+    fn offload_copy(block: &Part) -> Option<&Location> {
+        Self::locations(block).find(|p| !matches!(p, Location::Hbm { .. }))
+    }
+    /// A rank can use a block from its own HBM or from the block's offload
+    /// copy, including one still being stored. Other GPUs' HBM is no source.
+    fn usable(block: &Part, worker: usize, rank: usize) -> bool {
+        Self::locations(block).any(|p| match p {
+            Location::Hbm {
+                worker: w, rank: r, ..
+            } => (*w, *r) == (worker, rank),
+            _ => true,
+        }) || block
+            .pending
+            .as_deref()
+            .is_some_and(|(target, _)| !matches!(target, Location::Hbm { .. }))
     }
     fn refresh(&mut self, key: &BlockKey, touch: bool) {
         let Some(block) = self.blocks.get_mut(key) else {
             return;
         };
-        for location in Self::locations(block) {
-            let store = self.stores.get_mut(&location.store()).unwrap();
-            if store.reclaimable.remove(&(block.ordinal, key.clone())) {
-                store.reclaimable_bytes -= block.bytes;
-            }
-        }
         if touch {
             block.ordinal = self.next_block;
             self.next_block += 1;
         }
-        if block.pending.is_none() {
-            for location in Self::locations(block) {
-                let pinned_hbm = (!block.pins.is_empty() || self.queued_stores.contains(key))
-                    && matches!(location, Location::Hbm { .. });
-                let last_pinned_pool = !block.pins.is_empty()
-                    && block.replicas.is_empty()
-                    && matches!(location, Location::Pool { .. });
-                if pinned_hbm || last_pinned_pool {
-                    continue;
-                }
-                let store = self.stores.get_mut(&location.store()).unwrap();
-                if store.reclaimable.insert((block.ordinal, key.clone())) {
-                    store.reclaimable_bytes += block.bytes;
-                }
-            }
+        // A transfer reads the offload copy, or stores from the HBM location.
+        let source = block
+            .pending
+            .is_some()
+            .then(|| Self::offload_copy(block).unwrap_or(&block.location));
+        // The last pinned copy in the last tier is a restore source.
+        let last_pinned = !block.pins.is_empty() && block.replicas.is_empty();
+        for (position, location) in Self::locations(block).enumerate() {
+            let protected = source == Some(location)
+                || match location {
+                    // A pin protects its consumer's own copy; a queued store reads `location`.
+                    Location::Hbm { worker, rank, .. } => {
+                        block.pins.iter().any(|&(_, copy)| copy == (*worker, *rank))
+                            || position == 0 && self.queued_stores.contains(key)
+                    }
+                    Location::Host { .. } => last_pinned && self.placement_devices.is_empty(),
+                    Location::Pool { .. } => last_pinned,
+                };
+            self.stores
+                .get_mut(&location.store())
+                .unwrap()
+                .set_reclaimable(key, block.ordinal, block.bytes, !protected);
         }
+    }
+    /// The store's least recently used reclaimable copy.
+    fn oldest(&mut self, id: &StoreId) -> Option<(u64, BlockKey)> {
+        let store = self.stores.get_mut(id).unwrap();
+        while let Some((&indexed, &key)) = store.reclaimable.first_key_value() {
+            let ordinal = self.blocks[&key].ordinal;
+            if ordinal == indexed {
+                return Some((ordinal, key));
+            }
+            store.reclaimable.pop_first();
+            store.reclaimable.insert(ordinal, key);
+            store.reclaimable_ordinals.insert(key, ordinal);
+        }
+        None
     }
     fn discard_copy(&mut self, key: &BlockKey, store: &StoreId, now: f64) {
         let block = self.blocks.get_mut(key).unwrap();
-        let ordinal = block.ordinal;
         let location = if block.location.store() == *store {
-            if let Some(replacement) = block.replicas.pop() {
-                std::mem::replace(&mut block.location, replacement)
+            if block.replicas.is_empty() {
+                block.location
             } else {
-                block.location.clone()
+                let replacement = block.take_replica(block.replicas.len() - 1);
+                std::mem::replace(&mut block.location, replacement)
             }
         } else {
             let index = block
@@ -637,26 +981,23 @@ impl CxlPoolSystem {
                 .iter()
                 .position(|p| p.store() == *store)
                 .unwrap();
-            block.replicas.remove(index)
+            block.take_replica(index)
         };
         let last = block.location == location && block.replicas.is_empty();
         let bytes = block.bytes;
         let storage = self.stores.get_mut(store).unwrap();
-        if storage.reclaimable.remove(&(ordinal, key.clone())) {
-            storage.reclaimable_bytes -= bytes;
-        }
-        self.stores
-            .get_mut(store)
-            .unwrap()
-            .release(location.offset(), bytes);
+        storage.set_reclaimable(key, 0, bytes, false);
+        storage.release(location.offset(), bytes);
         if last {
-            let removed = self.blocks.remove(key).unwrap();
-            for (session, request) in removed.sessions {
-                let membership = (request, session);
-                if let Some(keys) = self.session_blocks.get_mut(&membership) {
-                    keys.remove(key);
-                    if keys.is_empty() {
-                        self.session_blocks.remove(&membership);
+            // A block leaves its sessions with its last part.
+            if let Some(removed) = self.blocks.remove(key) {
+                for &(session, request) in removed.sessions.iter() {
+                    let membership = (request, session);
+                    if let Some(names) = self.session_blocks.get_mut(&membership) {
+                        names.remove(&key.0);
+                        if names.is_empty() {
+                            self.session_blocks.remove(&membership);
+                        }
                     }
                 }
             }
@@ -664,14 +1005,15 @@ impl CxlPoolSystem {
             self.refresh(key, false);
         }
         if self.detailed_observations {
-            self.observations.push(serde_json::json!({"event":"cache_reclaimed","block":key.0,"part":key.1,"location":location,"bytes":bytes,"time":now}));
+            let block = self.block_name(key.0);
+            self.observations.push(serde_json::json!({"event":"cache_reclaimed","block":block,"part":key.1,"location":self.location_json(&location),"bytes":bytes,"time":now}));
         }
     }
     fn reclaim(&mut self, location: &Location, bytes_needed: u64, now: f64) -> Result<()> {
         let capacity = self.capacity(location)?;
         let id = location.store();
         while self.stores[&id].used.saturating_add(bytes_needed) > capacity {
-            let Some((_, key)) = self.stores[&id].reclaimable.first().cloned() else {
+            let Some((_, key)) = self.oldest(&id) else {
                 break;
             };
             self.discard_copy(&key, &id, now);
@@ -696,13 +1038,8 @@ impl CxlPoolSystem {
         );
         Ok(native)
     }
-    fn geometry(&self, worker: usize, rank: usize) -> (u64, u64, u64) {
-        let m = self.memory[worker][rank];
-        (
-            m.kv_bytes_per_token,
-            m.kv_bytes_per_request,
-            m.compatibility,
-        )
+    fn geometry(&self, worker: usize, rank: usize) -> u32 {
+        self.rank_geometry[worker][rank]
     }
     fn free_extent(&self, location: &Location, bytes: u64) -> Result<Option<u64>> {
         Ok(self
@@ -710,10 +1047,28 @@ impl CxlPoolSystem {
             .get(&location.store())
             .and_then(|store| store.available(bytes)))
     }
-    fn observe_location(&self, location: &Location) -> serde_json::Value {
-        let mut value = serde_json::to_value(location).unwrap();
+    fn location_json(&self, location: &Location) -> serde_json::Value {
+        match *location {
+            Location::Host {
+                node,
+                worker,
+                rank,
+                offset,
+            } => serde_json::json!({"tier":"host","node":self.host_names[node as usize],
+                "worker":worker,"rank":rank,"offset":offset}),
+            Location::Pool { device, offset } => serde_json::json!({"tier":"pool",
+                "device":self.placement_devices[device as usize],"offset":offset}),
+            Location::Hbm {
+                worker,
+                rank,
+                offset,
+            } => serde_json::json!({"tier":"hbm","worker":worker,"rank":rank,"offset":offset}),
+        }
+    }
+    fn observe_location(&self, location: &Location, bytes: u64) -> serde_json::Value {
+        let mut value = self.location_json(location);
         value["extents"] =
-            serde_json::to_value(&self.stores[&location.store()].allocations[&location.offset()])
+            serde_json::to_value(self.stores[&location.store()].extents(location.offset(), bytes))
                 .unwrap();
         value
     }
@@ -739,26 +1094,29 @@ impl CxlPoolSystem {
             Location::Host { worker, rank, .. } => {
                 Ok(self.fabric().worker_rank(*worker, *rank)?.dram.clone())
             }
-            Location::Pool { device, .. } => Ok(device.clone()),
+            Location::Pool { device, .. } => Ok(self.placement_devices[*device as usize].clone()),
             Location::Hbm { worker, rank, .. } => {
                 Ok(self.fabric().worker_rank(*worker, *rank)?.gpu.clone())
             }
         }
     }
+    /// Tell each worker whose HBM usage changed.
     fn sync_hbm(&mut self) -> Result<()> {
-        for worker in 0..self.instances.len() {
-            let bytes = (0..self.memory[worker].len())
+        let mut changed = BTreeSet::new();
+        for (id, store) in &mut self.stores {
+            if let StoreId::Hbm(worker, _) = *id {
+                if std::mem::take(&mut store.dirty) {
+                    changed.insert(worker);
+                }
+            }
+        }
+        for worker in changed {
+            let (bytes, reclaimable): (Vec<_>, Vec<_>) = (0..self.memory[worker].len())
                 .map(|rank| {
-                    self.used(&Location::Hbm {
-                        worker,
-                        rank,
-                        offset: 0,
-                    })
+                    let store = &self.stores[&StoreId::Hbm(worker, rank)];
+                    (store.used, store.reclaimable_bytes)
                 })
-                .collect::<Vec<_>>();
-            let reclaimable = (0..self.memory[worker].len())
-                .map(|rank| self.stores[&StoreId::Hbm(worker, rank)].reclaimable_bytes)
-                .collect::<Vec<_>>();
+                .unzip();
             self.instances[worker].set_external_kv_reclaimable_bytes(&reclaimable)?;
             self.instances[worker].set_external_kv_rank_bytes(&bytes)?;
         }
@@ -779,9 +1137,11 @@ impl CxlPoolSystem {
             .map(|(key, p)| (*key, p.config.clone()))
             .collect::<Vec<_>>();
         for (key, p) in waiting {
+            // `init` checks that every pressure host has capacity.
+            let node = self.host_index(&p.node).unwrap();
             if let Some(offset) = self.free_extent(
                 &Location::Host {
-                    node: p.node.clone(),
+                    node,
                     worker: 0,
                     rank: 0,
                     offset: 0,
@@ -789,7 +1149,7 @@ impl CxlPoolSystem {
                 p.bytes,
             )? {
                 self.stores
-                    .get_mut(&StoreId::Host(p.node.clone()))
+                    .get_mut(&StoreId::Host(node))
                     .unwrap()
                     .reserve(p.bytes)
                     .unwrap();
@@ -820,7 +1180,7 @@ impl CxlPoolSystem {
         let src = self.endpoint(&source)?;
         let dst = self.endpoint(&target)?;
         let bytes = self.blocks[key].bytes;
-        let block_index = self.blocks[key].index;
+        let block_index = self.blocks.block(key.0).index;
         let (source_id, destination_id) = self.fabric.as_mut().unwrap().transfer_route(
             &src,
             &dst,
@@ -837,7 +1197,7 @@ impl CxlPoolSystem {
             let index = self.transfers.len();
             self.transfers.push(Transfer {
                 kind: kind.into(),
-                block: Some(key.0.clone()),
+                block: Some(self.block_name(key.0)),
                 part: Some(key.1),
                 src_owner: Self::owner(&source),
                 dst_owner: Self::owner(&target),
@@ -881,7 +1241,7 @@ impl CxlPoolSystem {
             .unwrap()
             .pending
             .insert(complete);
-        self.blocks.get_mut(key).unwrap().pending = Some((target, complete));
+        self.blocks.get_mut(key).unwrap().pending = Some(Box::new((target, complete)));
         self.refresh(key, false);
         self.sync_hbm()?;
         Ok(complete)
@@ -890,8 +1250,7 @@ impl CxlPoolSystem {
         let start = (self.placement_cursor / self.stripe_blocks) % self.placement_devices.len();
         let eligible = (0..self.placement_devices.len())
             .map(|step| Location::Pool {
-                device: self.placement_devices[(start + step) % self.placement_devices.len()]
-                    .clone(),
+                device: ((start + step) % self.placement_devices.len()) as u32,
                 offset: 0,
             })
             .filter(|location| self.stores[&location.store()].capacity >= bytes)
@@ -905,17 +1264,12 @@ impl CxlPoolSystem {
                 .iter()
                 .find(|p| self.stores[&p.store()].available(bytes).is_some())
             {
-                return Ok(Some(target.clone()));
+                return Ok(Some(*target));
             }
-            let oldest = self
-                .placement_devices
-                .iter()
+            let oldest = (0..self.placement_devices.len())
                 .filter_map(|device| {
-                    let id = StoreId::Pool(device.clone());
-                    self.stores[&id]
-                        .reclaimable
-                        .first()
-                        .map(|(ordinal, key)| (*ordinal, key.clone(), id))
+                    let id = StoreId::Pool(device as u32);
+                    self.oldest(&id).map(|(ordinal, key)| (ordinal, key, id))
                 })
                 .min_by_key(|(ordinal, _, _)| *ordinal);
             let Some((_, key, store)) = oldest else {
@@ -926,18 +1280,20 @@ impl CxlPoolSystem {
     }
     fn spill_for(
         &mut self,
-        node: &str,
+        node: u32,
         additional: u64,
         now: f64,
         current: NodeID,
         graph: &mut Graph,
     ) -> Result<Vec<NodeID>> {
         let host = Location::Host {
-            node: node.into(),
+            node,
             worker: 0,
             rank: 0,
             offset: 0,
         };
+        let name = self.host_names[node as usize].clone();
+        let node = name.as_str();
         let requested = self.pressure_requested(node);
         let capacity = self.capacity(&host)?;
         ensure!(requested <= capacity, "pressure exceeds host capacity");
@@ -954,7 +1310,7 @@ impl CxlPoolSystem {
             .saturating_sub(capacity);
         let mut completions = Vec::new();
         while deficit > 0 {
-            let Some((_, key)) = self.stores[&host.store()].reclaimable.first().cloned() else {
+            let Some((_, key)) = self.oldest(&host.store()) else {
                 break;
             };
             let source = Self::locations(&self.blocks[&key])
@@ -962,7 +1318,10 @@ impl CxlPoolSystem {
                 .unwrap()
                 .clone();
             let bytes = self.blocks[&key].bytes;
-            if Self::locations(&self.blocks[&key]).any(|p| matches!(p, Location::Pool { .. })) {
+            // Without a pool, host DRAM is the last tier, as in vLLM CPU offloading.
+            if self.placement_devices.is_empty()
+                || Self::locations(&self.blocks[&key]).any(|p| matches!(p, Location::Pool { .. }))
+            {
                 self.discard_copy(&key, &host.store(), now);
             } else {
                 let Some(target) = self.pool_target(bytes, now)? else {
@@ -979,12 +1338,12 @@ impl CxlPoolSystem {
         self.admit_pressure(now)?;
         Ok(completions)
     }
-    fn spill(&mut self, node: &str, now: f64, current: NodeID, graph: &mut Graph) -> Result<()> {
+    fn spill(&mut self, node: u32, now: f64, current: NodeID, graph: &mut Graph) -> Result<()> {
         self.spill_for(node, 0, now, current, graph)?;
         Ok(())
     }
-    fn checkpoint_key(logical: &str, part: usize) -> BlockKey {
-        (format!("{logical}:recurrent-state"), part)
+    fn checkpoint_key(logical: &Name, part: usize) -> BlockKey {
+        (logical | 1, part)
     }
     fn own_key(&mut self, request: u64, index: usize, key: &BlockKey) {
         let session = self.session(request, index);
@@ -995,21 +1354,23 @@ impl CxlPoolSystem {
             .calls
             .get_mut(&index)
             .unwrap();
-        let block = self.blocks.get_mut(key).unwrap();
-        block.pins.insert(state.child);
-        block.sessions.insert(session.clone());
+        (self.blocks.get_mut(key).unwrap())
+            .pins
+            .insert((state.child, (state.binding.worker, state.ranks[key.1])));
+        let block = self.blocks.block_mut(key.0);
+        block.sessions.insert(session);
         state.owned_keys.insert((block.index, key.clone()));
         self.session_blocks
             .entry((request, session.0))
             .or_default()
-            .insert(key.clone());
+            .insert(key.0);
         self.refresh(key, true);
     }
     fn release_execution(&mut self, owned_keys: &BTreeSet<(u64, BlockKey)>, child: u64) {
         // Release suffixes first, as with the vLLM free-block queue.
         for (_, key) in owned_keys.iter().rev() {
             if let Some(block) = self.blocks.get_mut(key) {
-                block.pins.remove(&child);
+                block.pins.retain(|&(pin, _)| pin != child);
             }
             self.refresh(key, true);
         }
@@ -1025,13 +1386,10 @@ impl CxlPoolSystem {
         let Location::Hbm { worker, rank, .. } = block.location else {
             return Ok(());
         };
-        let node = self.fabric().worker_rank(worker, rank)?.node.clone();
-        ensure!(
-            self.host_capacity_bytes
-                .get(&node)
-                .is_some_and(|capacity| *capacity >= block.bytes),
-            "host capacity cannot hold one KV block"
-        );
+        let node = self.host_of(worker, rank)?;
+        let node = node
+            .filter(|&node| self.stores[&StoreId::Host(node)].capacity >= block.bytes)
+            .ok_or_else(|| anyhow!("host capacity cannot hold one KV block"))?;
         self.pending_stores
             .entry(node)
             .or_default()
@@ -1065,13 +1423,13 @@ impl CxlPoolSystem {
                 };
                 let bytes = block.bytes;
                 let target = Location::Host {
-                    node: node.clone(),
+                    node,
                     worker,
                     rank,
                     offset: 0,
                 };
                 if self.free_extent(&target, bytes)?.is_none() {
-                    self.spill_for(&node, bytes, now, current, graph)?;
+                    self.spill_for(node, bytes, now, current, graph)?;
                 }
                 if self.free_extent(&target, bytes)?.is_none() {
                     break;
@@ -1086,60 +1444,49 @@ impl CxlPoolSystem {
         }
         Ok(())
     }
-    fn issue_reads(
+    fn issue_read(
         &mut self,
         request: u64,
         index: usize,
+        key: BlockKey,
         now: f64,
         current: NodeID,
         graph: &mut Graph,
     ) -> Result<()> {
-        loop {
-            let (key, worker, issued, enqueue) = {
-                let call = self
-                    .active
-                    .get_mut(&request)
-                    .unwrap()
-                    .calls
-                    .get_mut(&index)
-                    .unwrap();
-                let limit = self.max_outstanding_reads;
-                let Some(position) = call
-                    .reads
-                    .iter()
-                    .position(|key| call.inflight.get(&key.1).copied().unwrap_or(0) < limit)
-                else {
-                    break;
-                };
-                let key = call.reads.remove(position).unwrap();
-                *call.inflight.entry(key.1).or_default() += 1;
-                (key, call.binding.worker, call.released, call.enqueue)
-            };
-            let source = self.blocks[&key].location.clone();
-            let kind = match source {
-                Location::Pool { .. } => "cxl_read",
-                Location::Host { .. } => "rdma_read",
-                Location::Hbm { .. } => "hbm_read",
-            };
-            // Destination extents were reserved at prepare; replace the placeholder.
-            let target = self.blocks.get_mut(&key).unwrap().pending.take().unwrap().0;
-            ensure!(
-                matches!(target,Location::Hbm{worker:w,..} if w==worker),
-                "invalid reload reservation"
-            );
-            let complete = self.move_block(
-                &key,
-                source,
-                target,
-                kind,
-                now,
-                issued,
-                current,
-                Some((request, index)),
-                graph,
-            )?;
-            graph.add_edge(complete, enqueue)?;
-        }
+        let call = &self.active[&request].calls[&index];
+        let loaded = call.loaded.expect("reads belong to a load");
+        let (worker, issued) = (call.binding.worker, call.load_started);
+        let source = Self::offload_copy(&self.blocks[&key])
+            .ok_or_else(|| anyhow!("reload of block without an offload copy"))?
+            .clone();
+        // Destination extents were reserved at prepare; replace the placeholder.
+        let target = self.blocks.get_mut(&key).unwrap().pending.take().unwrap().0;
+        let Location::Hbm {
+            worker: w, rank, ..
+        } = target
+        else {
+            bail!("invalid reload reservation");
+        };
+        ensure!(w == worker, "invalid reload reservation");
+        let kind = match &source {
+            Location::Pool { .. } => "cxl_read",
+            Location::Host { node, .. } if Some(*node) == self.host_of(worker, rank)? => {
+                "host_read"
+            }
+            _ => "rdma_read",
+        };
+        let complete = self.move_block(
+            &key,
+            source,
+            target,
+            kind,
+            now,
+            issued,
+            current,
+            Some((request, index)),
+            graph,
+        )?;
+        graph.add_edge(complete, loaded)?;
         Ok(())
     }
     fn wait_phase(&mut self, request: u64, index: usize, admission: bool, now: f64) {
@@ -1188,21 +1535,36 @@ impl CxlPoolSystem {
                 let retry = graph.add_logical_node(module, Event::Prepare { request, index });
                 graph.add_edge(current, retry)?;
                 graph.add_edge(barrier, retry)?;
+                // Younger calls keep waiting behind this one.
+                if let Some(own) = self.active[&request].calls[&index].admission_barrier {
+                    graph.add_edge(retry, own)?;
+                }
                 return Ok(());
             }
         }
+        // As in vLLM, the lookup covers the known tokens but the last, whose
+        // logits are needed; a resumed call knows its generated tokens too.
+        let known = self.instances[binding.worker]
+            .known_tokens(child)
+            .ok_or_else(|| anyhow!("call {child} is not queued on its worker"))?;
+        let lookup = (known.saturating_sub(1) / self.block_tokens) as usize;
         let mut restored = 0;
-        for logical in &binding.blocks {
+        for logical in binding.blocks.iter().take(lookup) {
             let mut available = true;
             for (part, &rank) in ranks.iter().enumerate() {
                 if self.part_bytes(binding.worker, rank, ranks.len())? == 0 {
                     continue;
                 }
-                if let Some(block) = self.blocks.get(&(logical.clone(), part)) {
+                if let Some(block) = self
+                    .blocks
+                    .get(&(logical.clone(), part))
+                    .filter(|block| Self::usable(block, binding.worker, rank))
+                {
                     ensure!(
                         block.bytes == self.part_bytes(binding.worker, rank, ranks.len())?
                             && block.geometry == self.geometry(binding.worker, rank),
-                        "incompatible physical KV geometry for {logical}"
+                        "incompatible physical KV geometry for {}",
+                        self.block_name(*logical)
                     );
                 } else {
                     available = false;
@@ -1228,7 +1590,7 @@ impl CxlPoolSystem {
                                 .blocks
                                 .get(&Self::checkpoint_key(&binding.blocks[count - 1], part))
                                 .is_some_and(|block| {
-                                    block.recurrent
+                                    Self::usable(block, binding.worker, rank)
                                         && block.bytes == bytes
                                         && block.geometry == self.geometry(binding.worker, rank)
                                 })
@@ -1277,7 +1639,7 @@ impl CxlPoolSystem {
                 offset: 0,
             };
             if !Self::locations(block).any(|p| p.same_store(&target)) {
-                if let Some((_, complete)) = &block.pending {
+                if let Some((_, complete)) = block.pending.as_deref() {
                     wait.insert(*complete);
                 }
             }
@@ -1299,13 +1661,24 @@ impl CxlPoolSystem {
             }
             return Ok(());
         }
-        let enqueue = self.active[&request].calls[&index].enqueue;
         // Pin the complete consuming prefix and its recurrent checkpoint before reclaiming.
         for key in &keys {
             self.own_key(request, index, key);
         }
-        let mut blocked = BTreeSet::new();
+        let restored_tokens = restored as u32 * self.block_tokens;
+        // As vLLM allocates a request's new tokens with its external prefix,
+        // the prefix loads only if the call can then be admitted.
+        let mut admission = Vec::new();
         for &rank in &ranks {
+            self.instances[binding.worker].reserve_external_admission(child, rank, 0)?;
+            admission.push(self.instances[binding.worker].external_admission_bytes(
+                rank,
+                known,
+                restored_tokens,
+            ));
+        }
+        let mut blocked = BTreeSet::new();
+        for (&rank, &admission) in ranks.iter().zip(&admission) {
             let target = Location::Hbm {
                 worker: binding.worker,
                 rank,
@@ -1318,7 +1691,8 @@ impl CxlPoolSystem {
                         && !Self::locations(&self.blocks[*key]).any(|p| p.same_store(&target))
                 })
                 .map(|key| self.blocks[key].bytes)
-                .sum::<u64>();
+                .sum::<u64>()
+                + admission;
             let budget = self.instances[binding.worker].external_kv_budget(rank)?;
             let private = self.capacity(&target)?.saturating_sub(budget);
             self.reclaim(&target, needed.saturating_add(private), now)?;
@@ -1330,11 +1704,12 @@ impl CxlPoolSystem {
                     blocked.extend(self.stores[&target.store()].pending.iter().copied());
                     for active in self.active.values() {
                         for (&index, other) in &active.calls {
-                            if other.child != child
-                                && other.binding.worker == binding.worker
-                                && other.ready.is_some()
-                                && !other.preempted
-                            {
+                            if other.child == child || other.binding.worker != binding.worker {
+                                continue;
+                            }
+                            if let Some(loaded) = other.loaded {
+                                blocked.insert(loaded);
+                            } else if other.ready.is_some() && !other.preempted {
                                 blocked.insert(active.completion[index]);
                             }
                         }
@@ -1347,6 +1722,17 @@ impl CxlPoolSystem {
             }
         }
         if !blocked.is_empty() {
+            // As in vLLM, a request that cannot be allocated holds no KV while
+            // it waits; its prefix is pinned again when it retries.
+            let state = self
+                .active
+                .get_mut(&request)
+                .unwrap()
+                .calls
+                .get_mut(&index)
+                .unwrap();
+            let owned = std::mem::take(&mut state.owned_keys);
+            self.release_execution(&owned, child);
             self.wait_phase(request, index, true, now);
             let retry = graph.add_logical_node(module, Event::Prepare { request, index });
             graph.add_edge(current, retry)?;
@@ -1377,32 +1763,95 @@ impl CxlPoolSystem {
             .get_mut(&index)
             .unwrap()
             .admission_barrier = None;
-        graph.add_edge(current, enqueue)?;
-        for key in keys {
-            let target = Location::Hbm {
-                worker: binding.worker,
-                rank: ranks[key.1],
-                offset: 0,
-            };
-            if Self::locations(&self.blocks[&key]).any(|p| p.same_store(&target)) {
-                continue;
-            }
-            let bytes = self.blocks[&key].bytes;
+        for (&rank, &admission) in ranks.iter().zip(&admission) {
+            self.instances[binding.worker].reserve_external_admission(child, rank, admission)?;
+        }
+        self.instances[binding.worker].set_external_admission_blocked(child, false)?;
+        let hbm = |key: &BlockKey| Location::Hbm {
+            worker: binding.worker,
+            rank: ranks[key.1],
+            offset: 0,
+        };
+        let missing = keys
+            .into_iter()
+            .filter(|key| !Self::locations(&self.blocks[key]).any(|p| p.same_store(&hbm(key))))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            self.sync_hbm()?;
+            return self.finish_load(request, index, now);
+        }
+        let loaded = graph.add_logical_node(module, Event::Loaded { request, index });
+        graph.add_edge(current, loaded)?;
+        let state = self
+            .active
+            .get_mut(&request)
+            .unwrap()
+            .calls
+            .get_mut(&index)
+            .unwrap();
+        state.loaded = Some(loaded);
+        state.load_started = now;
+        for key in &missing {
+            let target = hbm(key);
+            let bytes = self.blocks[key].bytes;
             self.reclaim(&target, bytes, now)?;
             let target = self.allocate(target, bytes)?;
-            self.blocks.get_mut(&key).unwrap().pending = Some((target, enqueue));
-            self.refresh(&key, false);
-            self.active
+            self.blocks.get_mut(key).unwrap().pending = Some(Box::new((target, loaded)));
+            self.refresh(key, false);
+        }
+        self.sync_hbm()?;
+        // Issue in prefix order up to each rank's limit; each completion issues its rank's next read.
+        for key in missing {
+            let state = self
+                .active
                 .get_mut(&request)
                 .unwrap()
                 .calls
                 .get_mut(&index)
-                .unwrap()
-                .reads
-                .push_back(key);
+                .unwrap();
+            if state.inflight[key.1] < self.max_outstanding_reads {
+                state.inflight[key.1] += 1;
+                self.issue_read(request, index, key, now, current, graph)?;
+            } else {
+                state.reads[key.1].push_back(key);
+            }
         }
-        self.sync_hbm()?;
-        self.issue_reads(request, index, now, current, graph)
+        Ok(())
+    }
+    /// The call's prefix is in HBM: it becomes schedulable with that prefix.
+    fn finish_load(&mut self, request: u64, index: usize, now: f64) -> Result<()> {
+        self.wait_phase(request, index, false, now);
+        let state = self
+            .active
+            .get_mut(&request)
+            .unwrap()
+            .calls
+            .get_mut(&index)
+            .unwrap();
+        ensure!(
+            state.inflight.iter().all(|&n| n == 0) && state.reads.iter().all(VecDeque::is_empty),
+            "prefix finished loading with KV transfers outstanding"
+        );
+        state.ready.get_or_insert(now);
+        state.loaded = None;
+        let resumed = std::mem::take(&mut state.preempted);
+        let (worker, child, ranks) = (state.binding.worker, state.child, state.ranks.clone());
+        let tokens = state.restored_blocks as u32 * self.block_tokens;
+        state.reused_tokens.get_or_insert(tokens);
+        let (released, preparation_wait, admission_wait) =
+            (state.released, state.preparation_wait, state.admission_wait);
+        self.instances[worker].restore_external_prefix(child, tokens)?;
+        self.instances[worker].set_external_pending(child, false)?;
+        self.instances[worker].set_external_blocked(child, false)?;
+        if self.detailed_observations {
+            let event = if resumed {
+                "request_resumed"
+            } else {
+                "kv_ready"
+            };
+            self.observations.push(serde_json::json!({"event":event,"request_id":request,"subrequest_index":index,"worker":worker,"ranks":ranks,"time":now,"released":released,"kv_preparation_wait":preparation_wait,"hbm_admission_wait":admission_wait,"restored_tokens":tokens}));
+        }
+        Ok(())
     }
     fn publish(
         &mut self,
@@ -1427,9 +1876,12 @@ impl CxlPoolSystem {
             state.checkpoint_source = None;
             let child = state.child;
             for key in &keys {
-                let block = self.blocks.get_mut(key).unwrap();
-                block.pins.remove(&child);
-                state.owned_keys.remove(&(block.index, key.clone()));
+                (self.blocks.get_mut(key).unwrap())
+                    .pins
+                    .retain(|&(pin, _)| pin != child);
+                state
+                    .owned_keys
+                    .remove(&(self.blocks.block(key.0).index, key.clone()));
             }
             for key in &keys {
                 self.refresh(key, true);
@@ -1454,10 +1906,10 @@ impl CxlPoolSystem {
         if state.binding.automatic {
             while state.binding.completed_blocks.len() < completed_count {
                 let position = state.binding.completed_blocks.len();
-                state
-                    .binding
-                    .completed_blocks
-                    .push(format!("private:{request}:{index}:{position}"));
+                let name = self
+                    .block_names
+                    .intern(&format!("private:{request}:{index}:{position}"));
+                state.binding.completed_blocks.push(name << 1);
             }
         }
         let worker = state.binding.worker;
@@ -1502,7 +1954,8 @@ impl CxlPoolSystem {
                 if let Some(block) = self.blocks.get(&key) {
                     ensure!(
                         block.bytes == bytes && block.geometry == self.geometry(worker, rank),
-                        "incompatible published KV geometry for {logical}"
+                        "incompatible published KV geometry for {}",
+                        self.block_name(*logical)
                     );
                 }
                 if !self
@@ -1513,27 +1966,23 @@ impl CxlPoolSystem {
                     self.reclaim(&target, bytes, now)?;
                     let target = self.allocate(target, bytes)?;
                     if let Some(block) = self.blocks.get_mut(&key) {
-                        block.replicas.push(target);
+                        block.add_replica(target);
                     } else {
-                        self.blocks.insert(
-                            key.clone(),
-                            Block {
-                                bytes,
-                                recurrent: false,
-                                geometry: self.geometry(worker, rank),
-                                index: position as u64,
-                                location: target,
-                                replicas: vec![],
-                                sessions: BTreeSet::new(),
-                                ordinal: self.next_block,
-                                pending: None,
-                                pins: BTreeSet::new(),
-                            },
-                        );
+                        let entry = Part {
+                            bytes,
+                            geometry: self.geometry(worker, rank),
+                            location: target,
+                            replicas: Box::default(),
+                            ordinal: self.next_block,
+                            pending: None,
+                            pins: SmallSet::default(),
+                        };
+                        (self.blocks).insert(key.clone(), ranks.len(), position as u64, entry);
                         self.next_block += 1;
                     }
                     if self.detailed_observations {
-                        self.observations.push(serde_json::json!({"event":"publish_computed","block":logical,"part":part,"rank":rank,"time":now,"bytes":bytes}));
+                        let block = self.block_name(*logical);
+                        self.observations.push(serde_json::json!({"event":"publish_computed","block":block,"part":part,"rank":rank,"time":now,"bytes":bytes}));
                     }
                 }
                 self.own_key(request, index, &key);
@@ -1557,10 +2006,9 @@ impl CxlPoolSystem {
                 };
                 if let Some(block) = self.blocks.get(&key) {
                     ensure!(
-                        block.recurrent
-                            && block.bytes == bytes
-                            && block.geometry == self.geometry(worker, rank),
-                        "incompatible recurrent checkpoint for {logical}"
+                        block.bytes == bytes && block.geometry == self.geometry(worker, rank),
+                        "incompatible recurrent checkpoint for {}",
+                        self.block_name(*logical)
                     );
                 }
                 if !self
@@ -1571,27 +2019,23 @@ impl CxlPoolSystem {
                     self.reclaim(&target, bytes, now)?;
                     let target = self.allocate(target, bytes)?;
                     if let Some(block) = self.blocks.get_mut(&key) {
-                        block.replicas.push(target);
+                        block.add_replica(target);
                     } else {
-                        self.blocks.insert(
-                            key.clone(),
-                            Block {
-                                bytes,
-                                recurrent: true,
-                                geometry: self.geometry(worker, rank),
-                                index: position as u64,
-                                location: target,
-                                replicas: vec![],
-                                sessions: BTreeSet::new(),
-                                ordinal: self.next_block,
-                                pending: None,
-                                pins: BTreeSet::new(),
-                            },
-                        );
+                        let entry = Part {
+                            bytes,
+                            geometry: self.geometry(worker, rank),
+                            location: target,
+                            replicas: Box::default(),
+                            ordinal: self.next_block,
+                            pending: None,
+                            pins: SmallSet::default(),
+                        };
+                        (self.blocks).insert(key.clone(), ranks.len(), position as u64, entry);
                         self.next_block += 1;
                     }
                     if self.detailed_observations {
-                        self.observations.push(serde_json::json!({"event":"publish_recurrent_checkpoint","block":key.0,"part":part,"rank":rank,"tokens":checkpoint_tokens,"time":now,"bytes":bytes}));
+                        let block = self.block_name(key.0);
+                        self.observations.push(serde_json::json!({"event":"publish_recurrent_checkpoint","block":block,"part":part,"rank":rank,"tokens":checkpoint_tokens,"time":now,"bytes":bytes}));
                     }
                 }
                 self.own_key(request, index, &key);
@@ -1640,38 +2084,34 @@ impl CxlPoolSystem {
                 }
                 let target = Location::Host {
                     node: self
-                        .fabric()
-                        .worker_rank(binding.worker, rank)?
-                        .node
-                        .clone(),
+                        .host_of(binding.worker, rank)?
+                        .ok_or_else(|| anyhow!("worker {} has no host capacity", binding.worker))?,
                     worker: binding.worker,
                     rank,
                     offset: 0,
                 };
                 let location = self.allocate(target, bytes)?;
-                self.blocks.insert(
-                    key.clone(),
-                    Block {
-                        bytes,
-                        recurrent: false,
-                        geometry: self.geometry(binding.worker, rank),
-                        index: index as u64,
-                        location,
-                        replicas: vec![],
-                        sessions: BTreeSet::from([self.session(request, binding.subrequest_index)]),
-                        ordinal: self.next_block,
-                        pending: None,
-                        pins: BTreeSet::new(),
-                    },
-                );
+                let entry = Part {
+                    bytes,
+                    geometry: self.geometry(binding.worker, rank),
+                    location,
+                    replicas: Box::default(),
+                    ordinal: self.next_block,
+                    pending: None,
+                    pins: SmallSet::default(),
+                };
+                (self.blocks).insert(key.clone(), ranks.len(), index as u64, entry);
                 self.next_block += 1;
+                let session = self.session(request, binding.subrequest_index);
+                self.blocks.block_mut(key.0).sessions.insert(session);
                 self.session_blocks
-                    .entry((request, self.session(request, binding.subrequest_index).0))
+                    .entry((request, session.0))
                     .or_default()
-                    .insert(key.clone());
+                    .insert(key.0);
                 self.refresh(&key, false);
                 if self.detailed_observations {
-                    self.observations.push(serde_json::json!({"event":"seed_host","block":logical,"part":part,"rank":rank,"time":now,"bytes":bytes}));
+                    let block = self.block_name(*logical);
+                    self.observations.push(serde_json::json!({"event":"seed_host","block":block,"part":part,"rank":rank,"time":now,"bytes":bytes}));
                 }
             }
         }
@@ -1688,33 +2128,6 @@ impl CxlPoolSystem {
         graph: &mut Graph,
     ) -> Result<()> {
         let worker = self.child_placement[&child].0;
-        if let Some(&(request, index)) = self.children.get(&child) {
-            let state = &self.active[&request].calls[&index];
-            if state.preempted && state.resume.is_none() {
-                let module = self as *mut Self as *mut dyn LogicalHandler;
-                let resume = graph.add_logical_node(
-                    module,
-                    Event::Resume {
-                        request,
-                        index,
-                        continuation,
-                    },
-                );
-                let state = self
-                    .active
-                    .get_mut(&request)
-                    .unwrap()
-                    .calls
-                    .get_mut(&index)
-                    .unwrap();
-                state.enqueue = resume;
-                state.resume = Some(continuation);
-                self.instances[worker].set_external_blocked(child, true)?;
-                graph.add_edge(resume, continuation)?;
-                self.prepare(request, index, now, current, graph)?;
-                return Ok(());
-            }
-        }
         self.instances[worker].set_external_admission_blocked(child, false)?;
         let required_bytes = self.instances[worker]
             .external_kv_requirement(ranks)
@@ -1765,17 +2178,20 @@ impl CxlPoolSystem {
             self.release_session(request, session.0, now);
         }
     }
-    fn release_session(&mut self, request: u64, session: String, now: f64) {
-        for key in self
+    fn release_session(&mut self, request: u64, session: Session, now: f64) {
+        for name in self
             .session_blocks
-            .remove(&(request, session.clone()))
+            .remove(&(request, session))
             .unwrap_or_default()
         {
-            if let Some(block) = self.blocks.get_mut(&key) {
-                block.sessions.remove(&(session.clone(), request));
+            if let Some(block) = self.blocks.blocks.get_mut(&name) {
+                block
+                    .sessions
+                    .retain(|&member| member != (session, request));
             }
         }
         if self.detailed_observations {
+            let session = &*self.session_names.names[session as usize];
             self.observations.push(serde_json::json!({"event":"session_references_released","request_id":request,"session_id":session,"time":now}));
         }
     }
@@ -1791,6 +2207,7 @@ impl CxlPoolSystem {
             input_tokens,
             interval,
             next,
+            kv_prefix,
             ..
         } = &mut sub
         {
@@ -1798,6 +2215,8 @@ impl CxlPoolSystem {
             *kv_tokens = Some(restored as u32 * self.block_tokens);
             *interval = None;
             next.clear();
+            // The pool owns prefix identity; the worker only executes the call.
+            *kv_prefix = None;
         }
         Request {
             request_id: child,
@@ -1816,8 +2235,9 @@ impl CxlPoolSystem {
     ) -> Result<()> {
         if let Some(pressure) = self.pressure_state.remove(&(request, index)) {
             if let Some(offset) = pressure.offset {
+                let node = self.host_index(&pressure.config.node).unwrap();
                 self.stores
-                    .get_mut(&StoreId::Host(pressure.config.node))
+                    .get_mut(&StoreId::Host(node))
                     .unwrap()
                     .release(offset, pressure.config.bytes);
             }
@@ -1837,14 +2257,16 @@ impl CxlPoolSystem {
             active.session_calls.values().all(|count| *count == 0),
             "session completed with outstanding node membership"
         );
-        for session in active.session_calls.keys() {
-            self.release_session(request, session.clone(), now);
+        let mut sessions = active.session_calls.keys().copied().collect::<Vec<_>>();
+        sessions.sort_by_key(|&session| &self.session_names.names[session as usize]);
+        for session in sessions {
+            self.release_session(request, session, now);
         }
         let result = RequestResult {
             request_id: request,
             arrival_time: active.request.arrival_time,
             initial: active.request.initial.clone(),
-            sub_requests: active.results.into_iter().map(Option::unwrap).collect(),
+            sub_requests: active.results.into_iter().map(|r| *r.unwrap()).collect(),
         };
         if self.detailed_observations {
             self.observations.push(
@@ -1901,12 +2323,16 @@ impl LogicalHandler for CxlPoolSystem {
                             .get_mut(&index)
                             .unwrap();
                         state.preempted = true;
+                        state.pending = true;
+                        state.loaded = None;
                         state.published_blocks = 0;
                         state.checkpoint_source = None;
                         state.restored_blocks = 0;
                         state.binding.blocks = state.binding.completed_blocks.clone();
                         let owned_keys = std::mem::take(&mut state.owned_keys);
+                        let worker = state.binding.worker;
                         self.release_execution(&owned_keys, request_id);
+                        self.instances[worker].set_external_pending(request_id, true)?;
                         if self.detailed_observations {
                             self.observations.push(serde_json::json!({"event":"request_preempted","request_id":request,"subrequest_index":index,"time":now}));
                         }
@@ -1929,6 +2355,30 @@ impl LogicalHandler for CxlPoolSystem {
                         )?;
                         return Ok(0.0);
                     }
+                    SystemEvent::KvLookup { request: child } => {
+                        let (request, index) = self.children[&child];
+                        let worker = self.child_placement[&child].0;
+                        let state = self
+                            .active
+                            .get_mut(&request)
+                            .unwrap()
+                            .calls
+                            .get_mut(&index)
+                            .unwrap();
+                        // Schedules prepared at one time may look up a call twice.
+                        if !std::mem::take(&mut state.pending) {
+                            return Ok(0.0);
+                        }
+                        state.wait_since = now;
+                        state.admission_waiting = false;
+                        self.instances[worker].set_external_blocked(child, true)?;
+                        self.prepare(request, index, now, current, graph)?;
+                        // A call that cannot fit keeps its turn: later ones wait.
+                        if self.active[&request].calls[&index].admission_waiting {
+                            self.instances[worker].set_external_admission_blocked(child, true)?;
+                        }
+                        return Ok(0.0);
+                    }
                     SystemEvent::RequestCompleted { request, result } => (request, result),
                 };
                 let (request, index) = self
@@ -1943,25 +2393,43 @@ impl LogicalHandler for CxlPoolSystem {
                     .remove(&index)
                     .unwrap();
                 self.release_execution(&state.owned_keys, child.request_id);
+                // A reused prefix whose offload copy was evicted during the call
+                // is written again; one that survived is not.
+                for (index, key) in &state.owned_keys {
+                    if *index < state.restored_blocks as u64 && self.blocks.contains_key(key) {
+                        self.queue_store(*key)?;
+                    }
+                }
                 self.child_placement.remove(&child.request_id);
                 let mut child_result = result.sub_requests.into_iter().next().unwrap();
                 if let ResultSubRequest::Llm {
-                    token_latency,
                     next,
                     interval,
                     model,
+                    kv_prefix,
+                    ttft_parts,
+                    reused_tokens,
                     ..
                 } = &mut child_result
                 {
-                    if let Some(first) = token_latency.first_mut() {
-                        *first += state.ready.unwrap() - state.released;
+                    if let Some(parts) = ttft_parts {
+                        // The child queued from release: its queue time
+                        // includes loading its prefix and waiting for HBM.
+                        parts.kv_load = state.preparation_wait;
+                        parts.admission = state.admission_wait;
+                        parts.queue = (parts.queue - parts.kv_load - parts.admission).max(0.0);
+                        self.first_token_waits.0 += 1;
+                        self.first_token_waits.1 += parts.kv_load + parts.admission + parts.queue;
                     }
+                    *reused_tokens = state.reused_tokens;
                     let original = &self.active[&request].request.sub_requests[index];
                     *next = original.next().to_vec();
                     *interval = original.interval();
                     *model = original.model().map(str::to_owned);
+                    *kv_prefix = original.kv_prefix().cloned();
                 }
-                self.active.get_mut(&request).unwrap().results[index] = Some(child_result);
+                self.active.get_mut(&request).unwrap().results[index] =
+                    Some(Box::new(child_result));
                 self.seed(&state.binding, &state.ranks, request, now)?;
                 self.store_completed(now, current, graph)?;
                 graph.add_edge(current, self.active[&request].completion[index])?;
@@ -2006,7 +2474,7 @@ impl LogicalHandler for CxlPoolSystem {
                             offset: None,
                         },
                     );
-                    self.spill(&node, now, current, graph)?;
+                    self.spill(self.host_index(&node).unwrap(), now, current, graph)?;
                 }
                 for background in self
                     .background
@@ -2062,14 +2530,14 @@ impl LogicalHandler for CxlPoolSystem {
                         session_id,
                     } => {
                         self.active.get_mut(&request).unwrap().results[index] =
-                            Some(ResultSubRequest::ToolCall {
+                            Some(Box::new(ResultSubRequest::ToolCall {
                                 input_tokens,
                                 output_tokens,
                                 next,
                                 duration: duration.unwrap_or(0.0),
                                 interval,
                                 session_id,
-                            });
+                            }));
                         let tool = graph.add_logical_node(
                             module,
                             Event::ToolRun {
@@ -2083,7 +2551,8 @@ impl LogicalHandler for CxlPoolSystem {
                     SubRequest::Llm { .. } => {
                         let mut binding = self.binding(request, index);
                         if binding.automatic {
-                            binding.worker = self.route(request, index, now)?;
+                            let blocks = binding.blocks.clone();
+                            binding.worker = self.route(request, index, &blocks, now)?;
                         }
                         let child = self.next_child;
                         self.next_child += 1;
@@ -2103,8 +2572,7 @@ impl LogicalHandler for CxlPoolSystem {
                             );
                             self.fabric().worker_rank(binding.worker, rank)?;
                         }
-                        let enqueue =
-                            graph.add_logical_node(module, Event::Enqueue { request, index });
+                        let worker = binding.worker;
                         self.children.insert(child, (request, index));
                         self.child_placement
                             .insert(child, (binding.worker, ranks.clone()));
@@ -2113,13 +2581,16 @@ impl LogicalHandler for CxlPoolSystem {
                             CallState {
                                 binding,
                                 child,
+                                reads: vec![VecDeque::new(); ranks.len()],
+                                inflight: vec![0; ranks.len()],
                                 ranks,
                                 released: now,
                                 ready: None,
-                                enqueue,
-                                reads: VecDeque::new(),
-                                inflight: BTreeMap::new(),
+                                pending: true,
+                                loaded: None,
+                                load_started: now,
                                 restored_blocks: 0,
+                                reused_tokens: None,
                                 published_blocks: 0,
                                 owned_keys: BTreeSet::new(),
                                 checkpoint_source: None,
@@ -2129,50 +2600,35 @@ impl LogicalHandler for CxlPoolSystem {
                                 admission_waiting: false,
                                 admission_barrier: None,
                                 preempted: false,
-                                resume: None,
                             },
                         );
-                        self.prepare(request, index, now, current, graph)?;
+                        // As in vLLM, the call waits in its worker's queue and
+                        // looks up and loads its prefix at its turn.
+                        self.instances[worker].set_external_pending(child, true)?;
+                        self.instances[worker].add_request_arrival(
+                            child_request,
+                            graph,
+                            Some(current),
+                            Some(module),
+                        )?;
                         Ok(0.0)
                     }
                 }
             }
             Event::Prepare { request, index } => {
                 self.prepare(request, index, now, current, graph)?;
+                if let Some(state) = self.active[&request].calls.get(&index) {
+                    if !state.admission_waiting {
+                        let worker = state.binding.worker;
+                        self.instances[worker].wake(current, graph)?;
+                    }
+                }
                 Ok(0.0)
             }
-            Event::Enqueue { request, index } => {
-                self.wait_phase(request, index, false, now);
-                let state = self
-                    .active
-                    .get_mut(&request)
-                    .unwrap()
-                    .calls
-                    .get_mut(&index)
-                    .unwrap();
-                ensure!(
-                    state.inflight.values().all(|&n| n == 0) && state.reads.is_empty(),
-                    "call released before KV transfers drained"
-                );
-                state.ready = Some(now);
-                let worker = state.binding.worker;
-                let child = state.child;
-                let kv_tokens = state.restored_blocks as u32 * self.block_tokens;
-                let released = state.released;
-                let admission_wait = state.admission_wait;
-                let preparation_wait = state.preparation_wait;
-                let ranks = state.ranks.clone();
-                let child_request = self.child_request(request, index, child, now);
-                self.instances[worker].reserve_external_prefix(child, kv_tokens)?;
-                self.instances[worker].add_request_arrival(
-                    child_request,
-                    graph,
-                    Some(current),
-                    Some(module),
-                )?;
-                if self.detailed_observations {
-                    self.observations.push(serde_json::json!({"event":"kv_ready","request_id":request,"subrequest_index":index,"worker":worker,"ranks":ranks,"time":now,"released":released,"kv_preparation_wait":preparation_wait,"hbm_admission_wait":admission_wait,"restored_tokens":kv_tokens}));
-                }
+            Event::Loaded { request, index } => {
+                self.finish_load(request, index, now)?;
+                let worker = self.active[&request].calls[&index].binding.worker;
+                self.instances[worker].wake(current, graph)?;
                 Ok(0.0)
             }
             Event::MoveComplete {
@@ -2183,7 +2639,7 @@ impl LogicalHandler for CxlPoolSystem {
                 release_source,
             } => {
                 let block = self.blocks.get_mut(&key).unwrap();
-                let (target, complete) = block
+                let (target, complete) = *block
                     .pending
                     .take()
                     .ok_or_else(|| anyhow!("completion missing pending block"))?;
@@ -2199,13 +2655,20 @@ impl LogicalHandler for CxlPoolSystem {
                     .remove(&complete);
                 if matches!(target, Location::Hbm { .. }) {
                     let previous = std::mem::replace(&mut block.location, target);
-                    block.replicas.push(previous);
+                    block.add_replica(previous);
                 } else if release_source && block.location == source {
                     let previous = std::mem::replace(&mut block.location, target);
-                    block.replicas.push(previous);
+                    block.add_replica(previous);
                 } else {
-                    block.replicas.push(target);
+                    block.add_replica(target);
                 }
+                ensure!(
+                    Self::locations(block)
+                        .filter(|p| !matches!(p, Location::Hbm { .. }))
+                        .count()
+                        <= 1 + usize::from(release_source),
+                    "a block keeps one offload copy"
+                );
                 if release_source {
                     let bytes = block.bytes;
                     self.discard_copy(&key, &source.store(), now);
@@ -2221,46 +2684,19 @@ impl LogicalHandler for CxlPoolSystem {
                 self.sync_hbm()?;
                 self.admit_pressure(now)?;
                 if let Some((request, index)) = call {
-                    *self
+                    let state = self
                         .active
                         .get_mut(&request)
                         .unwrap()
                         .calls
                         .get_mut(&index)
-                        .unwrap()
-                        .inflight
-                        .get_mut(&key.1)
-                        .expect("completed read was outstanding") -= 1;
-                    self.issue_reads(request, index, now, current, graph)?;
+                        .unwrap();
+                    match state.reads[key.1].pop_front() {
+                        Some(next) => self.issue_read(request, index, next, now, current, graph)?,
+                        None => state.inflight[key.1] -= 1,
+                    }
                 }
                 self.store_completed(now, current, graph)?;
-                Ok(0.0)
-            }
-            Event::Resume {
-                request,
-                index,
-                continuation,
-            } => {
-                let state = self
-                    .active
-                    .get_mut(&request)
-                    .unwrap()
-                    .calls
-                    .get_mut(&index)
-                    .unwrap();
-                let tokens = state.restored_blocks as u32 * self.block_tokens;
-                state.resume = None;
-                state.preempted = false;
-                let worker = state.binding.worker;
-                let child = state.child;
-                self.instances[worker].restore_external_prefix(child, tokens)?;
-                self.instances[worker].set_external_blocked(child, false)?;
-                let ranks = self.child_placement[&child].1.clone();
-                self.ensure_capacity(child, &ranks, 0, continuation, now, current, graph)?;
-                graph.add_edge(current, continuation)?;
-                if self.detailed_observations {
-                    self.observations.push(serde_json::json!({"event":"request_resumed","request_id":request,"subrequest_index":index,"restored_tokens":tokens,"time":now}));
-                }
                 Ok(0.0)
             }
             Event::Capacity {
@@ -2306,42 +2742,32 @@ impl Module for CxlPoolSystem {
         Ok(())
     }
     fn observe(&self) -> serde_json::Value {
-        let mut preparation = 0;
-        let mut admission = 0;
-        let mut by_worker = vec![(0, 0); self.instances.len()];
-        for call in self.active_calls() {
-            if call.ready.is_none() {
-                if call.admission_waiting {
-                    admission += 1;
-                } else {
-                    preparation += 1;
-                }
-            }
-            if call.ready.is_none() || call.resume.is_some() {
-                by_worker[call.binding.worker].0 += 1;
-            }
-            if call.resume.is_some() {
-                by_worker[call.binding.worker].1 += 1;
-            }
-        }
-        let blocks = self.detailed_observations.then(|| self.blocks.iter().map(|((key,part),b)|serde_json::json!({"key":key,"part":part,"bytes":b.bytes,"kind":if b.recurrent {"recurrent_state"} else {"attention"},"checkpoint_tokens":b.recurrent.then_some((b.index + 1) * u64::from(self.block_tokens)),"location":self.observe_location(&b.location),"ready":true,"replicas":Self::locations(b).map(|p|self.observe_location(p)).collect::<Vec<_>>(),"sessions":b.sessions,"source_valid":true,"pending_ready":false,"pending":b.pending.as_ref().map(|(p,_)|self.observe_location(p)),"pins":b.pins})).collect::<Vec<_>>());
-        let hosts=self.host_capacity_bytes.iter().map(|(node,capacity)|serde_json::json!({"node":node,"capacity_bytes":capacity,"block_bytes":self.used(&Location::Host{node:node.clone(),worker:0,rank:0,offset:0}).saturating_sub(self.pressure_state.values().filter(|p|p.config.node==*node&&p.offset.is_some()).map(|p|p.config.bytes).sum::<u64>()),"pressure_requested_bytes":self.pressure_requested(node),"pressure_reserved_bytes":self.pressure_state.values().filter(|p|p.config.node==*node&&p.offset.is_some()).map(|p|p.config.bytes).sum::<u64>()})).collect::<Vec<_>>();
-        let pools=self.placement_devices.iter().map(|device|serde_json::json!({"device":device,"occupied_or_reserved_bytes":self.used(&Location::Pool{device:device.clone(),offset:0})})).collect::<Vec<_>>();
+        let blocks = self.detailed_observations.then(|| {
+            let mut blocks = self.blocks.iter().map(|((name, part), shared, b)| (self.block_name(name), part, name, shared, b)).collect::<Vec<_>>();
+            blocks.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+            blocks.into_iter().map(|(key,part,name,shared,b)|{
+                let mut sessions = shared.sessions.iter().map(|&(session, request)| (&*self.session_names.names[session as usize], request)).collect::<Vec<_>>();
+                let mut pins = b.pins.iter().map(|&(pin, _)| pin).collect::<Vec<_>>();
+                pins.sort();
+                sessions.sort();
+                serde_json::json!({"key":key,"part":part,"bytes":b.bytes,"kind":if name & 1 == 1 {"recurrent_state"} else {"attention"},"checkpoint_tokens":(name & 1 == 1).then_some((shared.index + 1) * u64::from(self.block_tokens)),"location":self.observe_location(&b.location,b.bytes),"ready":true,"replicas":Self::locations(b).map(|p|self.observe_location(p,b.bytes)).collect::<Vec<_>>(),"sessions":sessions,"source_valid":true,"pending_ready":false,"pending":b.pending.as_deref().map(|(p,_)|self.observe_location(p,b.bytes)),"pins":pins})}).collect::<Vec<_>>()
+        });
+        let hosts=self.host_names.iter().enumerate().map(|(index,node)|serde_json::json!({"node":node,"capacity_bytes":self.host_capacity_bytes[node],"block_bytes":self.used(&Location::Host{node:index as u32,worker:0,rank:0,offset:0}).saturating_sub(self.pressure_state.values().filter(|p|p.config.node==*node&&p.offset.is_some()).map(|p|p.config.bytes).sum::<u64>()),"pressure_requested_bytes":self.pressure_requested(node),"pressure_reserved_bytes":self.pressure_state.values().filter(|p|p.config.node==*node&&p.offset.is_some()).map(|p|p.config.bytes).sum::<u64>()})).collect::<Vec<_>>();
+        let pools=self.placement_devices.iter().enumerate().map(|(index,device)|serde_json::json!({"device":device,"occupied_or_reserved_bytes":self.used(&Location::Pool{device:index as u32,offset:0})})).collect::<Vec<_>>();
         let hbm=(0..self.instances.len()).flat_map(|worker|(0..self.memory[worker].len()).map(move |rank|serde_json::json!({"worker":worker,"rank":rank,"occupied_or_reserved_bytes":self.used(&Location::Hbm{worker,rank,offset:0})}))).collect::<Vec<_>>();
-        serde_json::json!({"cxl_pool":{"hosts":hosts,"pool_usage":pools,"hbm_usage":hbm,"block_count":self.blocks.len(),"transfer_totals":self.transfer_totals,"detailed_observations":self.detailed_observations,"blocks":blocks,"transfers":self.detailed_observations.then_some(&self.transfers),"events":self.detailed_observations.then_some(&self.observations),"host_bytes_freed":self.host_bytes_freed,"kv_preparation_waiting_requests":preparation,"hbm_admission_waiting_requests":admission,"kv_preparation_waiting_by_worker":by_worker.iter().enumerate().map(|(worker, (requests, resumed))|serde_json::json!({"worker":worker,"requests":requests,"resumed_requests":resumed})).collect::<Vec<_>>(),"unfinished_requests":self.active.len(),"unfinished_transfers":self.unfinished_transfers,"topology":self.detailed_observations.then(|| self.fabric.as_ref().map(TopologyNetwork::observe))},"instances":self.instances.iter().map(|s|s.observe()).collect::<Vec<_>>()})
+        serde_json::json!({"cxl_pool":{"hosts":hosts,"pool_usage":pools,"hbm_usage":hbm,"block_count":self.blocks.len(),"transfer_totals":self.transfer_totals,"detailed_observations":self.detailed_observations,"blocks":blocks,"transfers":self.detailed_observations.then_some(&self.transfers),"events":self.detailed_observations.then_some(&self.observations),"host_bytes_freed":self.host_bytes_freed,"unfinished_requests":self.active.len(),"unfinished_transfers":self.unfinished_transfers,"topology":self.detailed_observations.then(|| self.fabric.as_ref().map(TopologyNetwork::observe))},"instances":self.instances.iter().map(|s|s.observe()).collect::<Vec<_>>()})
     }
 }
 impl System for CxlPoolSystem {
+    fn first_token_waits(&self) -> Option<(u64, f64)> {
+        Some(self.first_token_waits)
+    }
     fn init(&mut self) -> Result<()> {
         ensure!(!self.instances.is_empty(), "cxl_pool needs workers");
         self.inflight_calls = vec![0; self.instances.len()];
         ensure!(
             self.block_tokens > 0 && self.stripe_blocks > 0 && self.max_outstanding_reads > 0,
             "block size, stripe and read concurrency must be positive"
-        );
-        ensure!(
-            !self.placement_devices.is_empty(),
-            "placement device set is empty"
         );
         ensure!(
             self.placement_devices.iter().collect::<BTreeSet<_>>().len()
@@ -2365,15 +2791,35 @@ impl System for CxlPoolSystem {
             }
             self.memory.push(ranks);
         }
-        for (node, &capacity) in &self.host_capacity_bytes {
+        self.host_names = self.host_capacity_bytes.keys().cloned().collect();
+        for (index, &capacity) in self.host_capacity_bytes.values().enumerate() {
             self.stores
-                .insert(StoreId::Host(node.clone()), Store::new(capacity));
+                .insert(StoreId::Host(index as u32), Store::new(capacity));
         }
-        for device in &self.placement_devices {
+        for (index, device) in self.placement_devices.iter().enumerate() {
             self.stores.insert(
-                StoreId::Pool(device.clone()),
+                StoreId::Pool(index as u32),
                 Store::new(self.fabric().memory_capacity(device)?),
             );
+        }
+        for ranks in &self.memory {
+            let mut ids = Vec::new();
+            for m in ranks {
+                let geometry = (
+                    m.kv_bytes_per_token,
+                    m.kv_bytes_per_request,
+                    m.compatibility,
+                );
+                let id = match self.geometries.iter().position(|g| *g == geometry) {
+                    Some(id) => id,
+                    None => {
+                        self.geometries.push(geometry);
+                        self.geometries.len() - 1
+                    }
+                };
+                ids.push(id as u32);
+            }
+            self.rank_geometry.push(ids);
         }
         for (worker, memory) in self.memory.iter().enumerate() {
             for (rank, memory) in memory.iter().enumerate() {
@@ -2434,6 +2880,22 @@ impl System for CxlPoolSystem {
                 == self.calls.len(),
             "duplicate call binding"
         );
+        for call in &self.calls {
+            let mut intern = |names: &[String]| {
+                names
+                    .iter()
+                    .map(|name| self.block_names.intern(name) << 1)
+                    .collect::<Vec<_>>()
+            };
+            self.configured.push(CallBinding {
+                automatic: false,
+                subrequest_index: call.subrequest_index,
+                worker: call.worker,
+                blocks: intern(&call.blocks),
+                completed_blocks: intern(&call.completed_blocks),
+                seed_host_blocks: intern(&call.seed_host_blocks),
+            });
+        }
         ensure!(
             self.pressures
                 .iter()
@@ -2516,15 +2978,17 @@ impl System for CxlPoolSystem {
                 graph.add_edge(complete[index], arrival[next])?;
             }
         }
+        let sessions = request
+            .sub_requests
+            .iter()
+            .map(|sub| match sub.session_id() {
+                Some(session) => self.session_names.intern(session),
+                None => self.session_names.intern(&format!("request:{id}")),
+            })
+            .collect::<Vec<_>>();
         let mut session_calls = BTreeMap::new();
-        for sub in &request.sub_requests {
-            *session_calls
-                .entry(
-                    sub.session_id()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("request:{id}")),
-                )
-                .or_default() += 1;
+        for &session in &sessions {
+            *session_calls.entry(session).or_default() += 1;
         }
         let conservative_sessions = request.sub_requests.iter().any(|sub| {
             matches!(
@@ -2544,6 +3008,7 @@ impl System for CxlPoolSystem {
                 sink,
                 completion: complete,
                 calls: BTreeMap::new(),
+                sessions,
                 session_calls,
                 conservative_sessions,
             },
@@ -2557,8 +3022,10 @@ impl System for CxlPoolSystem {
         );
         ensure!(
             self.blocks
-                .values()
-                .all(|b| b.pending.is_none() && b.pins.is_empty() && b.sessions.is_empty()),
+                .iter()
+                .all(|(_, block, part)| part.pending.is_none()
+                    && part.pins.is_empty()
+                    && block.sessions.is_empty()),
             "cxl_pool finished with moving, pinned, or session-owned blocks"
         );
         ensure!(
@@ -2583,18 +3050,18 @@ mod storage_tests {
     use serde_json::json;
 
     #[test]
-    fn vllm_dp_balances_bursts_and_avoids_kv_bound_queues() {
+    fn least_loaded_balances_bursts_and_avoids_kv_bound_queues() {
         // Empty snapshot: the in-flight floor and rotating start spread a burst.
         let empty = vec![(0.0, 0.0, 0.0); 2];
-        assert_eq!(vllm_dp_choice(&empty, &[0, 0], 0), 0);
-        assert_eq!(vllm_dp_choice(&empty, &[1, 0], 1), 1);
-        assert_eq!(vllm_dp_choice(&empty, &[1, 1], 0), 0);
+        assert_eq!(least_loaded_choice(&empty, &[0, 0], 0), 0);
+        assert_eq!(least_loaded_choice(&empty, &[1, 0], 1), 1);
+        assert_eq!(least_loaded_choice(&empty, &[1, 1], 0), 0);
         // 2 + 2 + 2·6·(1.0 − 0.5) = 10 loses to 3 + 2 at 40% usage.
         let pressured = vec![(2.0, 2.0, 1.0), (3.0, 2.0, 0.4)];
-        assert_eq!(vllm_dp_choice(&pressured, &[0, 0], 0), 1);
+        assert_eq!(least_loaded_choice(&pressured, &[0, 0], 0), 1);
         // Without waiting, KV usage does not matter.
         let idle = vec![(0.0, 3.0, 1.0), (0.0, 4.0, 0.0)];
-        assert_eq!(vllm_dp_choice(&idle, &[0, 0], 1), 0);
+        assert_eq!(least_loaded_choice(&idle, &[0, 0], 1), 0);
     }
 
     #[test]
@@ -2606,7 +3073,9 @@ mod storage_tests {
         store.release(handles[0], 4);
         store.release(handles[2], 4);
         let combined = store.reserve(8).unwrap();
-        assert_eq!(store.allocations[&combined], vec![(0, 4), (8, 4)]);
+        assert_eq!(*store.allocations[&combined], [(0, 4), (8, 4)]);
+        // Contiguous allocations keep no extent record.
+        assert_eq!(store.allocations.len(), 1);
         assert_eq!(store.used, 16);
         assert!(store.reserve(1).is_none());
         store.release(combined, 8);
@@ -2620,40 +3089,34 @@ mod storage_tests {
             "block_tokens":1, "host_capacity_bytes":{"host":4}, "placement_devices":["D"]
         })).unwrap();
         system.fabric = Some(system.topology.build().unwrap());
-        system
-            .stores
-            .insert(StoreId::Pool("D".into()), Store::new(4));
-        system
-            .stores
-            .insert(StoreId::Host("host".into()), Store::new(4));
+        system.host_names = vec!["host".into()];
+        system.stores.insert(StoreId::Pool(0), Store::new(4));
+        system.stores.insert(StoreId::Host(0), Store::new(4));
         let location = system
             .allocate(
                 Location::Pool {
-                    device: "D".into(),
+                    device: 0,
                     offset: 0,
                 },
                 4,
             )
             .unwrap();
-        let key = ("fixture:restore-source".to_owned(), 0);
-        system.blocks.insert(
-            key.clone(),
-            Block {
-                bytes: 4,
-                recurrent: false,
-                geometry: (4, 0, 0),
-                index: 0,
-                location,
-                replicas: vec![],
-                sessions: BTreeSet::from([("session".into(), 7)]),
-                ordinal: 0,
-                pending: None,
-                pins: BTreeSet::new(),
-            },
-        );
+        let key = (system.block_name_id("fixture:restore-source"), 0);
+        let session = system.session_names.intern("session");
+        let part = Part {
+            bytes: 4,
+            geometry: 0,
+            location,
+            replicas: Box::default(),
+            ordinal: 0,
+            pending: None,
+            pins: SmallSet::default(),
+        };
+        system.blocks.insert(key, 1, 0, part);
+        system.blocks.block_mut(key.0).sessions.insert((session, 7));
         system
             .session_blocks
-            .insert((7, "session".into()), BTreeSet::from([key.clone()]));
+            .insert((7, session), BTreeSet::from([key.0]));
         system.refresh(&key, false);
         (system, key)
     }
@@ -2661,10 +3124,10 @@ mod storage_tests {
     #[test]
     fn last_copy_eviction_removes_session_membership_index() {
         let (mut system, key) = directory_with_pool_source();
-        system.discard_copy(&key, &StoreId::Pool("D".into()), 0.0);
-        assert!(system.blocks.is_empty());
+        system.discard_copy(&key, &StoreId::Pool(0), 0.0);
+        assert_eq!(system.blocks.len(), 0);
         assert!(system.session_blocks.is_empty());
-        assert_eq!(system.stores[&StoreId::Pool("D".into())].used, 0);
+        assert_eq!(system.stores[&StoreId::Pool(0)].used, 0);
         assert!(system.observations.is_empty());
     }
 
@@ -2674,7 +3137,7 @@ mod storage_tests {
         let host = system
             .allocate(
                 Location::Host {
-                    node: "host".into(),
+                    node: 0,
                     worker: 0,
                     rank: 0,
                     offset: 0,
@@ -2683,20 +3146,17 @@ mod storage_tests {
             )
             .unwrap();
         let block = system.blocks.get_mut(&key).unwrap();
-        block.replicas.push(host);
-        block.pins.insert(99); // Consumer awaits HBM capacity before issuing its reload.
+        block.add_replica(host);
+        block.pins.insert((99, (0, 0))); // Consumer awaits HBM capacity before issuing its reload.
         system.refresh(&key, false);
-        assert_eq!(
-            system.stores[&StoreId::Pool("D".into())].reclaimable_bytes,
-            4
-        );
-        system.discard_copy(&key, &StoreId::Host("host".into()), 0.0);
+        assert_eq!(system.stores[&StoreId::Pool(0)].reclaimable_bytes, 4);
+        system.discard_copy(&key, &StoreId::Host(0), 0.0);
         assert!(system.pool_target(4, 1.0).unwrap().is_none());
         assert!(system.blocks.contains_key(&key));
-        system.blocks.get_mut(&key).unwrap().pins.clear();
+        system.blocks.get_mut(&key).unwrap().pins.retain(|_| false);
         system.refresh(&key, false);
         assert!(system.pool_target(4, 2.0).unwrap().is_some());
-        assert!(system.blocks.is_empty());
+        assert_eq!(system.blocks.len(), 0);
     }
 
     #[test]
@@ -2705,7 +3165,7 @@ mod storage_tests {
         let host = system
             .allocate(
                 Location::Host {
-                    node: "host".into(),
+                    node: 0,
                     worker: 0,
                     rank: 0,
                     offset: 0,
@@ -2713,12 +3173,14 @@ mod storage_tests {
                 4,
             )
             .unwrap();
-        system.blocks.get_mut(&key).unwrap().replicas.push(host);
-        system.blocks.get_mut(&key).unwrap().pins.insert(99);
-        system.discard_copy(&key, &StoreId::Pool("D".into()), 0.0);
-        assert_eq!(
-            system.stores[&StoreId::Host("host".into())].reclaimable_bytes,
-            4
-        );
+        system.blocks.get_mut(&key).unwrap().add_replica(host);
+        system
+            .blocks
+            .get_mut(&key)
+            .unwrap()
+            .pins
+            .insert((99, (0, 0)));
+        system.discard_copy(&key, &StoreId::Pool(0), 0.0);
+        assert_eq!(system.stores[&StoreId::Host(0)].reclaimable_bytes, 4);
     }
 }
