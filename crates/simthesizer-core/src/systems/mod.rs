@@ -1,3 +1,4 @@
+pub mod cxl_pool;
 pub mod moe_ep_multi_instance;
 pub mod multi_instance;
 pub mod pd_disaggregation;
