@@ -235,9 +235,28 @@ impl Engine {
         mut self,
         mut observe: impl FnMut(f64, &dyn System) -> Result<()>,
     ) -> Result<Vec<RequestResult>> {
+        self.drive(|time, system| observe(time, system))?;
+        self.system.into_results()
+    }
+
+    /// Like `run_with_observer`, but hands each finished request to `emit`
+    /// after the observation of its timestamp instead of keeping it.
+    pub fn run_streaming(
+        mut self,
+        mut observe: impl FnMut(f64, &dyn System) -> Result<()>,
+        mut emit: impl FnMut(RequestResult) -> Result<()>,
+    ) -> Result<()> {
+        self.drive(|time, system| {
+            observe(time, system)?;
+            system.take_results().into_iter().try_for_each(&mut emit)
+        })?;
+        self.system.into_results()?.into_iter().try_for_each(emit)
+    }
+
+    fn drive(&mut self, mut observe: impl FnMut(f64, &mut dyn System) -> Result<()>) -> Result<()> {
         let mut queue = self.ready_queue()?;
         if queue.peek().is_none_or(|entry| entry.time > 0.0) {
-            observe(0.0, self.system.as_ref())?;
+            observe(0.0, self.system.as_mut())?;
         }
         let mut ran = false;
         while let Some(entry) = queue.pop() {
@@ -260,7 +279,7 @@ impl Engine {
                     continue;
                 }
                 if std::mem::take(&mut ran) {
-                    observe(entry.time, self.system.as_ref())?;
+                    observe(entry.time, self.system.as_mut())?;
                 }
             }
         }
@@ -270,7 +289,7 @@ impl Engine {
                 self.graph.nodes.len()
             );
         }
-        self.system.into_results()
+        Ok(())
     }
 
     fn ready_queue(&self) -> Result<BinaryHeap<QueueEntry>> {

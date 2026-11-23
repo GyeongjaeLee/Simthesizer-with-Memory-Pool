@@ -129,6 +129,13 @@ impl System for MultiInstanceSystem {
         Ok(())
     }
 
+    fn take_results(&mut self) -> Vec<RequestResult> {
+        self.instances
+            .iter_mut()
+            .flat_map(|instance| instance.take_results())
+            .collect()
+    }
+
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
         let MultiInstanceSystem {
             instances,

@@ -12,7 +12,7 @@ mod write_jsonl;
 mod write_trace;
 
 use crate::saturation::{Saturated, Saturation};
-use crate::write_jsonl::write_results_jsonl;
+use crate::write_jsonl::ResultsWriter;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -105,8 +105,9 @@ fn main() -> Result<()> {
         }
         None => None,
     };
+    let mut results = ResultsWriter::new(&args.output_jsonl)?;
     let mut next = 0;
-    let outcome = Engine::new(graph, config.system).run_with_observer(|time, system| {
+    let observe = |time, system: &dyn System| {
         if let Some((_, writer)) = &mut trace {
             if times.is_empty() {
                 writer.observe(time, system.observe())?;
@@ -123,10 +124,12 @@ fn main() -> Result<()> {
             }
         }
         Ok(())
-    });
+    };
+    let outcome =
+        Engine::new(graph, config.system).run_streaming(observe, |row| results.push(&row));
     let status = match outcome {
-        Ok(results) => {
-            write_results_jsonl(&args.output_jsonl, &results)?;
+        Ok(()) => {
+            results.finish(&args.output_jsonl)?;
             serde_json::json!({"status": "complete"})
         }
         Err(error) => {

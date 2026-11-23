@@ -130,6 +130,12 @@ pub trait System: Module + LogicalHandler {
         sink: Option<*mut dyn LogicalHandler>,
     ) -> Result<()>;
 
+    /// Moves out requests completed since the last call; `into_results`
+    /// returns the rest.
+    fn take_results(&mut self) -> Vec<RequestResult> {
+        Vec::new()
+    }
+
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>>;
 }
 

@@ -597,6 +597,10 @@ impl System for PdDisaggregationSystem {
         Ok(())
     }
 
+    fn take_results(&mut self) -> Vec<RequestResult> {
+        std::mem::take(&mut self.results)
+    }
+
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
         if !self.pending_requests.is_empty() {
             bail!(

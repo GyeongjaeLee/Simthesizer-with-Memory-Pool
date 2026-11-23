@@ -106,6 +106,94 @@ impl Interner {
     }
 }
 
+/// A logical block name, stored compactly; `BlockNames::name` spells it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum BlockId {
+    /// `{namespace}:{hash:016x}`; the namespace indexes `BlockNames::strings`.
+    Hashed { namespace: u32, hash: u64 },
+    /// `private:{request}:{index}:{position}`: computed KV without identity.
+    Private {
+        request: u64,
+        index: u32,
+        position: u32,
+    },
+    /// Any other configured name, indexing `BlockNames::strings`.
+    Other(u32),
+}
+
+/// Dense block IDs in first-seen order, as `Name`s. Each spelling maps to one
+/// `BlockId`, so a configured name equal to a generated one shares its ID.
+#[derive(Default)]
+struct BlockNames {
+    blocks: Vec<BlockId>,
+    ids: HashMap<BlockId, u64>,
+    /// Namespaces and other configured names.
+    strings: Interner,
+}
+impl BlockNames {
+    fn id(&mut self, block: BlockId) -> Name {
+        let next = self.blocks.len() as u64;
+        let id = *self.ids.entry(block).or_insert(next);
+        if id == next {
+            self.blocks.push(block);
+        }
+        id << 1
+    }
+    fn namespace(&mut self, namespace: &str) -> u32 {
+        self.strings.intern(namespace) as u32
+    }
+    /// The ID of a spelled name, recognizing the generated spellings.
+    fn parse(&mut self, name: &str) -> Name {
+        let hashed = name.rsplit_once(':').filter(|(_, hex)| {
+            hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        let block = if let Some((namespace, hex)) = hashed {
+            BlockId::Hashed {
+                namespace: self.namespace(namespace),
+                hash: u64::from_str_radix(hex, 16).unwrap(),
+            }
+        } else if let Some(block) = Self::private(name) {
+            block
+        } else {
+            BlockId::Other(self.strings.intern(name) as u32)
+        };
+        self.id(block)
+    }
+    fn private(name: &str) -> Option<BlockId> {
+        let mut parts = name.strip_prefix("private:")?.split(':');
+        let (request, index, position) = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        let block = BlockId::Private {
+            request,
+            index,
+            position,
+        };
+        (parts.next().is_none() && format!("private:{request}:{index}:{position}") == name)
+            .then_some(block)
+    }
+    fn name(&self, name: Name) -> String {
+        let logical = match self.blocks[(name >> 1) as usize] {
+            BlockId::Hashed { namespace, hash } => {
+                format!("{}:{hash:016x}", self.strings.names[namespace as usize])
+            }
+            BlockId::Private {
+                request,
+                index,
+                position,
+            } => format!("private:{request}:{index}:{position}"),
+            BlockId::Other(id) => self.strings.names[id as usize].to_string(),
+        };
+        if name & 1 == 1 {
+            format!("{logical}:recurrent-state")
+        } else {
+            logical
+        }
+    }
+}
+
 /// A small set in an exactly sized slice. An emptied `BTreeSet` keeps its
 /// node, and every block keeps its sets for its whole life.
 #[derive(Debug, Default)]
@@ -180,7 +268,7 @@ pub struct CxlPoolSystem {
     binding_index: BTreeMap<(u64, usize), usize>,
     /// Logical block names; see `Name`.
     #[serde(skip)]
-    block_names: Interner,
+    block_names: BlockNames,
     #[serde(skip)]
     session_names: Interner,
     #[serde(default)]
@@ -708,6 +796,7 @@ impl CxlPoolSystem {
             let mut previous = 0u64;
             if let Some(prefix) = active.unwrap().request.resolved_kv_prefix(index) {
                 use std::hash::{Hash, Hasher};
+                let namespace = self.block_names.namespace(&prefix.namespace);
                 let group = if self.block_tokens.is_multiple_of(prefix.block_tokens) {
                     (self.block_tokens / prefix.block_tokens) as usize
                 } else {
@@ -719,7 +808,10 @@ impl CxlPoolSystem {
                     self.block_tokens.hash(&mut hash);
                     ids.hash(&mut hash);
                     previous = hash.finish();
-                    names.push(format!("{}:{previous:016x}", prefix.namespace));
+                    names.push(BlockId::Hashed {
+                        namespace,
+                        hash: previous,
+                    });
                 }
             } else if let Some(input) = input_token_ids {
                 // A token trace identifies its computed KV: the input and any
@@ -727,14 +819,21 @@ impl CxlPoolSystem {
                 let output = output_token_ids.as_deref().unwrap_or_default();
                 let computed = (input_tokens + output_tokens.saturating_sub(1)) as usize;
                 let tokens: Vec<u32> = input.iter().chain(output).take(computed).copied().collect();
+                let namespace = self.block_names.namespace("tokens");
                 for block in tokens.chunks_exact(self.block_tokens as usize) {
                     previous = hash_block(previous, block, &[]);
-                    names.push(format!("tokens:{previous:016x}"));
+                    names.push(BlockId::Hashed {
+                        namespace,
+                        hash: previous,
+                    });
                 }
             }
             restorable = (input_tokens.saturating_sub(1) / self.block_tokens) as usize;
         }
-        binding.completed_blocks = names.iter().map(|name| self.block_name_id(name)).collect();
+        binding.completed_blocks = names
+            .into_iter()
+            .map(|block| self.block_names.id(block))
+            .collect();
         binding.blocks = binding
             .completed_blocks
             .iter()
@@ -743,16 +842,8 @@ impl CxlPoolSystem {
             .collect();
         binding
     }
-    fn block_name_id(&mut self, name: &str) -> Name {
-        self.block_names.intern(name) << 1
-    }
     fn block_name(&self, name: Name) -> String {
-        let logical = &*self.block_names.names[(name >> 1) as usize];
-        if name & 1 == 1 {
-            format!("{logical}:recurrent-state")
-        } else {
-            logical.to_owned()
-        }
+        self.block_names.name(name)
     }
     /// vLLM counts queued requests, including those loading external KV, as
     /// waiting and admitted ones as running.
@@ -1906,10 +1997,12 @@ impl CxlPoolSystem {
         if state.binding.automatic {
             while state.binding.completed_blocks.len() < completed_count {
                 let position = state.binding.completed_blocks.len();
-                let name = self
-                    .block_names
-                    .intern(&format!("private:{request}:{index}:{position}"));
-                state.binding.completed_blocks.push(name << 1);
+                let name = self.block_names.id(BlockId::Private {
+                    request,
+                    index: index.try_into().unwrap(),
+                    position: position.try_into().unwrap(),
+                });
+                state.binding.completed_blocks.push(name);
             }
         }
         let worker = state.binding.worker;
@@ -2884,7 +2977,7 @@ impl System for CxlPoolSystem {
             let mut intern = |names: &[String]| {
                 names
                     .iter()
-                    .map(|name| self.block_names.intern(name) << 1)
+                    .map(|name| self.block_names.parse(name))
                     .collect::<Vec<_>>()
             };
             self.configured.push(CallBinding {
@@ -3015,6 +3108,9 @@ impl System for CxlPoolSystem {
         );
         Ok(())
     }
+    fn take_results(&mut self) -> Vec<RequestResult> {
+        std::mem::take(&mut self.results)
+    }
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
         ensure!(
             self.active.is_empty() && self.children.is_empty(),
@@ -3048,6 +3144,35 @@ impl System for CxlPoolSystem {
 mod storage_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn spelled_block_names_share_generated_ids() {
+        let mut names = BlockNames::default();
+        let namespace = names.namespace("ns:a");
+        let hashed = names.id(BlockId::Hashed {
+            namespace,
+            hash: 0xab,
+        });
+        let private = names.id(BlockId::Private {
+            request: 7,
+            index: 1,
+            position: 2,
+        });
+        assert_eq!(names.parse("ns:a:00000000000000ab"), hashed);
+        assert_eq!(names.parse("private:7:1:2"), private);
+        for spelled in [
+            "ns:a:00000000000000AB",
+            "private:+7:1:2",
+            "private:7:1",
+            "B0",
+        ] {
+            let id = names.parse(spelled);
+            assert!(id != hashed && id != private);
+            assert_eq!(names.name(id), spelled);
+        }
+        assert_eq!(names.name(hashed), "ns:a:00000000000000ab");
+        assert_eq!(names.name(private | 1), "private:7:1:2:recurrent-state");
+    }
 
     #[test]
     fn least_loaded_balances_bursts_and_avoids_kv_bound_queues() {
@@ -3101,7 +3226,7 @@ mod storage_tests {
                 4,
             )
             .unwrap();
-        let key = (system.block_name_id("fixture:restore-source"), 0);
+        let key = (system.block_names.parse("fixture:restore-source"), 0);
         let session = system.session_names.intern("session");
         let part = Part {
             bytes: 4,
