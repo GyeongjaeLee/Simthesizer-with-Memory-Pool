@@ -3,7 +3,7 @@ name = "simthesizer"
 version = "0.1.0"
 description = "Simthesizer Python tooling"
 requires-python = ">=3.14,<3.15"
-dependencies = ["matplotlib>=3.9,<4"]
+dependencies = ["matplotlib>=3.9,<4", "orjson>=3.10,<4"]
 
 [dependency-groups]
 dev = ["ruff"]
