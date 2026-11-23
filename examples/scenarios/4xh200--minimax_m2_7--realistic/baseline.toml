@@ -1,0 +1,15 @@
+# The FPM campaign's resolved vLLM 0.25.1 settings.
+[engine]
+model = "MiniMaxAI/MiniMax-M2.7"
+revision = "d494266a4affc0d2995ba1fa35c8481cbd84294b"
+tensor_parallel_size = 4
+kv_cache_dtype = "fp8"
+load_format = "dummy"
+block_size = 16
+max_num_batched_tokens = 8192
+gpu_memory_utilization = 0.92
+skip_tokenizer_init = true
+enable_prefix_caching = true
+enable_chunked_prefill = true
+async_scheduling = false
+generation_config = "vllm"

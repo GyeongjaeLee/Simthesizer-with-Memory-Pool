@@ -406,7 +406,12 @@ impl LogicalHandler for SingleInstanceSystem {
 
 impl Module for SingleInstanceSystem {
     fn observe(&self) -> serde_json::Value {
-        serde_json::json!({"scheduler": self.scheduler.observe()})
+        let mut value = serde_json::json!({"scheduler": self.scheduler.observe()});
+        let runner = self.model_runner.observe();
+        if !runner.is_null() {
+            value["model_runner"] = runner;
+        }
+        value
     }
 
     fn resolve_path(&mut self, base_dir: &Path) -> Result<()> {

@@ -1,3 +1,4 @@
+pub mod forward_pass;
 pub mod model_runner;
 pub mod moe_ep;
 pub mod ring;
