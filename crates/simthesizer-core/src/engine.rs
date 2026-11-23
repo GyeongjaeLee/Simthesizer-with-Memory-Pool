@@ -1,25 +1,30 @@
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::compute_sim::ComputeSimulator;
 use crate::module::LogicalHandler;
 use crate::network_sim::NetworkSimulator;
 use crate::system::System;
 use crate::types::{
-    ComputeContext, Layer, NetworkDeviceID, NodeID, PollResult, RequestResult, RequestState,
+    ComputeContext, FastMap, Layer, NetworkDeviceID, NodeID, PollResult, RequestResult,
+    RequestState,
 };
 
 pub struct Graph {
     next_node_id: NodeID,
-    nodes: HashMap<NodeID, Node>,
+    nodes: FastMap<NodeID, Node>,
 }
 
 pub struct Engine {
     graph: Graph,
     system: Box<dyn System>,
+    deferred: Vec<NodeID>,
+    /// Queue entries superseded by an earlier wake-up, counted by
+    /// `(node, time bits)`.
+    superseded: FastMap<(NodeID, u64), usize>,
 }
 
 struct Node {
@@ -72,7 +77,7 @@ impl Graph {
     pub fn new() -> Self {
         Self {
             next_node_id: 0,
-            nodes: HashMap::new(),
+            nodes: FastMap::default(),
         }
     }
 
@@ -213,7 +218,12 @@ impl Graph {
 
 impl Engine {
     pub fn new(graph: Graph, system: Box<dyn System>) -> Self {
-        Self { graph, system }
+        Self {
+            graph,
+            system,
+            deferred: Vec::new(),
+            superseded: FastMap::default(),
+        }
     }
 
     pub fn run(self) -> Result<Vec<RequestResult>> {
@@ -230,10 +240,29 @@ impl Engine {
         if queue.peek().is_none_or(|entry| entry.time > 0.0) {
             observe(0.0, self.system.as_ref())?;
         }
+        let mut ran = false;
         while let Some(entry) = queue.pop() {
-            self.process_entry(entry, &mut queue)?;
+            let key = (entry.node_id, entry.time.to_bits());
+            if let Some(count) = self.superseded.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.superseded.remove(&key);
+                }
+            } else {
+                self.process_entry(entry, &mut queue)?;
+                ran = true;
+            }
             if queue.peek().is_none_or(|next| next.time != entry.time) {
-                observe(entry.time, self.system.as_ref())?;
+                if !self.deferred.is_empty() {
+                    queue.extend(self.deferred.drain(..).map(|node_id| QueueEntry {
+                        time: entry.time,
+                        node_id,
+                    }));
+                    continue;
+                }
+                if std::mem::take(&mut ran) {
+                    observe(entry.time, self.system.as_ref())?;
+                }
             }
         }
         if !self.graph.nodes.is_empty() {
@@ -325,7 +354,7 @@ impl Engine {
         entry: QueueEntry,
         queue: &mut BinaryHeap<QueueEntry>,
     ) -> Result<()> {
-        let (start_time, poll_result) = {
+        let (start_time, simulator, poll_result) = {
             let node = self
                 .graph
                 .nodes
@@ -348,13 +377,23 @@ impl Engine {
                         // NOTE: Safety: network nodes store simulator pointers to stable
                         // system-owned allocations. Engine execution is single-threaded, so
                         // mutable simulator calls never overlap.
-                        (&mut *simulator).simulate(src, dst, bytes, start_time, state)?
+                        (&mut *simulator).simulate(
+                            entry.node_id,
+                            src,
+                            dst,
+                            bytes,
+                            start_time,
+                            state,
+                        )?
                     };
-                    (start_time, poll_result)
+                    (start_time, simulator, poll_result)
                 }
                 _ => bail!("node {} is not a network node", entry.node_id),
             }
         };
+        for (node_id, time) in unsafe { (&mut *simulator).take_wakeups() } {
+            self.wake(node_id, time, start_time, queue)?;
+        }
         match poll_result {
             PollResult::Pending { latency } => {
                 let next_time = start_time + latency;
@@ -378,7 +417,39 @@ impl Engine {
             PollResult::Complete { latency } => {
                 self.complete_node(entry.node_id, start_time, latency, queue)
             }
+            PollResult::Deferred => {
+                self.deferred.push(entry.node_id);
+                Ok(())
+            }
         }
+    }
+
+    /// Bring a pending network poll forward to `time`.
+    fn wake(
+        &mut self,
+        node_id: NodeID,
+        time: f64,
+        now: f64,
+        queue: &mut BinaryHeap<QueueEntry>,
+    ) -> Result<()> {
+        ensure!(
+            time.is_finite() && time >= now,
+            "wake-up of node {node_id} at {time} precedes {now}"
+        );
+        let node = self
+            .graph
+            .nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| anyhow!("woken node {node_id} is missing"))?;
+        if time < node.start_time {
+            *self
+                .superseded
+                .entry((node_id, node.start_time.to_bits()))
+                .or_default() += 1;
+            node.start_time = time;
+            queue.push(QueueEntry { time, node_id });
+        }
+        Ok(())
     }
 
     fn process_logical_node(

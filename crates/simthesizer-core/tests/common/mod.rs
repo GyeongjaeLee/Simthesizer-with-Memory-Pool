@@ -37,6 +37,7 @@ impl simthesizer_core::NetworkSimulator for RecordingNetwork {
     }
     fn simulate(
         &mut self,
+        node: u64,
         src: u64,
         dst: u64,
         bytes: u64,
@@ -46,7 +47,10 @@ impl simthesizer_core::NetworkSimulator for RecordingNetwork {
         if state.is_none() {
             TRANSFERS.with(|calls| calls.borrow_mut().push((src, dst, bytes)));
         }
-        self.flow.simulate(src, dst, bytes, now, state)
+        self.flow.simulate(node, src, dst, bytes, now, state)
+    }
+    fn take_wakeups(&mut self) -> Vec<(u64, f64)> {
+        self.flow.take_wakeups()
     }
 }
 

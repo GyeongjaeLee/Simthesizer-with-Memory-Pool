@@ -176,6 +176,7 @@ impl NetworkSimulator for BadPoll {
         _: u64,
         _: u64,
         _: u64,
+        _: u64,
         _: f64,
         state: &mut Option<Box<dyn Any>>,
     ) -> Result<PollResult> {

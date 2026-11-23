@@ -3,7 +3,7 @@ use std::any::Any;
 use anyhow::Result;
 
 use crate::module::Module;
-use crate::types::{NetworkDeviceID, PollResult};
+use crate::types::{NetworkDeviceID, NodeID, PollResult};
 
 pub trait NetworkSimulator: Module {
     fn add_device(&mut self) -> NetworkDeviceID;
@@ -18,12 +18,19 @@ pub trait NetworkSimulator: Module {
 
     fn simulate(
         &mut self,
+        node: NodeID,
         src: NetworkDeviceID,
         dst: NetworkDeviceID,
         bytes: u64,
         now: f64,
         state: &mut Option<Box<dyn Any>>,
     ) -> Result<PollResult>;
+
+    /// Pending nodes to poll earlier than answered, as `(node, time)`. The
+    /// engine asks after every poll; a wrapper must forward it.
+    fn take_wakeups(&mut self) -> Vec<(NodeID, f64)> {
+        Vec::new()
+    }
 }
 
 crate::declare_registry! {

@@ -33,12 +33,21 @@ fn finish(net: &mut FlowNetworkSimulator, transfers: &[(u64, u64, u64, f64)]) ->
             return Ok(done);
         };
         let (src, dst, bytes, _) = transfers[index];
-        match net.simulate(src, dst, bytes, now, &mut states[index])? {
+        match net.simulate(index as u64, src, dst, bytes, now, &mut states[index])? {
+            PollResult::Deferred => pending.push((now, index)),
             PollResult::Complete { latency } => done[index] = now + latency,
             PollResult::Pending { latency } => {
                 assert!(latency.is_finite() && now + latency > now);
                 pending.push((now + latency, index));
             }
+        }
+        for (node, time) in net.take_wakeups() {
+            let entry = pending
+                .iter_mut()
+                .find(|entry| entry.1 == node as usize)
+                .unwrap();
+            assert!(time >= now && time < entry.0);
+            entry.0 = time;
         }
     }
     bail!("network failed to drain")
@@ -71,11 +80,56 @@ fn a_short_flow_releases_bandwidth_without_delaying_the_long_flows_completion() 
 }
 
 #[test]
+fn capacity_a_bottlenecked_flow_cannot_use_goes_to_the_others() {
+    // 0 -> 2 is capped at 10 before the shared 2 -> 3 link (64). Max-min gives
+    // 10 and 54, so both payloads finish together at 1 s; an equal split would
+    // hold the second flow at 32 until the first ends (1.34375 s).
+    let mut net = network(
+        4,
+        &[(0, 2, 10.0, 0.0), (1, 2, 1000.0, 0.0), (2, 3, 64.0, 0.0)],
+    );
+    let done = finish(&mut net, &[(0, 3, 10, 0.0), (1, 3, 54, 0.0)]).unwrap();
+    close(done[0], 1.0);
+    close(done[1], 1.0);
+}
+
+#[test]
+fn a_later_flow_that_speeds_up_another_brings_its_completion_forward() {
+    // A uses 0 -> 1, B uses 0 -> 1 -> 2, C uses 1 -> 2; all get 5, so A is due
+    // at 20 s. D joins 1 -> 2 at 11 s, cutting B to 10/3, so A rises to 20/3
+    // until D leaves at 12.5 s and finishes its last 35 bytes at 19.5 s.
+    let mut net = network(3, &[(0, 1, 10.0, 0.0), (1, 2, 10.0, 0.0)]);
+    let transfers = [
+        (0, 1, 100, 0.0),
+        (0, 2, 1000, 0.0),
+        (1, 2, 1000, 0.0),
+        (1, 2, 5, 11.0),
+    ];
+    let done = finish(&mut net, &transfers).unwrap();
+    close(done[3], 12.5);
+    close(done[0], 19.5);
+}
+
+#[test]
 fn staggered_arrivals_change_rates_only_after_arrival() {
     let mut net = network(2, &[(0, 1, 10.0, 0.0)]);
     let done = finish(&mut net, &[(0, 1, 10, 0.0), (0, 1, 20, 0.5)]).unwrap();
     close(done[0], 1.5);
     close(done[1], 3.0);
+}
+
+#[test]
+fn flows_on_one_route_finish_in_size_order_under_equal_sharing() {
+    // Sizes 10, 20, ..., 100 at 10 B/s: the k-th ends after the previous one
+    // plus its 10 extra bytes at 10/(10 - k) B/s, i.e. 10, 19, 27, ..., 55 s.
+    let mut net = network(2, &[(0, 1, 10.0, 0.0)]);
+    let transfers = (1..=10).map(|k| (0, 1, 10 * k, 0.0)).collect::<Vec<_>>();
+    let done = finish(&mut net, &transfers).unwrap();
+    let mut expected = 0.0;
+    for (k, time) in done.into_iter().enumerate() {
+        expected += (10 - k) as f64;
+        close(time, expected);
+    }
 }
 
 #[test]
@@ -150,9 +204,9 @@ fn unreachable_destination_and_invalid_links_fail() {
 fn network_time_must_be_finite_and_monotone() {
     for now in [-1.0, f64::NAN, f64::INFINITY] {
         let mut net = network(2, &[(0, 1, 1.0, 0.0)]);
-        assert!(net.simulate(0, 1, 1, now, &mut None).is_err());
+        assert!(net.simulate(0, 0, 1, 1, now, &mut None).is_err());
     }
     let mut net = network(2, &[]);
-    net.simulate(0, 0, 0, 2.0, &mut None).unwrap();
-    assert!(net.simulate(0, 0, 0, 1.0, &mut None).is_err());
+    net.simulate(0, 0, 0, 0, 2.0, &mut None).unwrap();
+    assert!(net.simulate(0, 0, 0, 0, 1.0, &mut None).is_err());
 }

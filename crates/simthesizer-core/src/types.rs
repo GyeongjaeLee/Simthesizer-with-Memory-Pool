@@ -425,6 +425,31 @@ fn validate_initial_indices(initial: &[usize], sub_requests: &[SubRequest]) -> R
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PollResult {
-    Pending { latency: f64 },
-    Complete { latency: f64 },
+    Pending {
+        latency: f64,
+    },
+    Complete {
+        latency: f64,
+    },
+    /// Poll again once every other event at this time has run.
+    Deferred,
 }
+
+/// Fx hash for small integer keys; SipHash dominated directory and graph updates.
+#[derive(Default)]
+pub struct KeyHasher(u64);
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        bytes.iter().for_each(|&byte| self.write_u64(byte.into()));
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+pub type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<KeyHasher>>;
