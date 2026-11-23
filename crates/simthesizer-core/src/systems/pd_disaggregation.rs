@@ -154,6 +154,9 @@ impl PdDisaggregationSystem {
                 model: None,
                 input_token_ids,
                 output_token_ids,
+                kv_prefix: original.sub_requests[0].kv_prefix().cloned(),
+                session_id: original.sub_requests[0].session_id().map(str::to_owned),
+                provider_tokens: original.sub_requests[0].provider_tokens().cloned(),
             }],
         }
     }
@@ -166,7 +169,9 @@ impl PdDisaggregationSystem {
             tokens.output_tokens.min(1),
             0,
             tokens.input_token_ids.map(<[u32]>::to_vec),
-            tokens.output_token_ids.map(<[u32]>::to_vec),
+            tokens
+                .output_token_ids
+                .map(|ids| ids[..tokens.output_tokens.min(1) as usize].to_vec()),
         );
         if let SubRequest::Llm {
             interval, model, ..
@@ -194,13 +199,16 @@ impl PdDisaggregationSystem {
         }
 
         let carried_output = prefill_request.total_output_tokens() as usize;
-        let input_token_ids = tokens.input_token_ids.map(|input_token_ids| {
-            let mut combined = input_token_ids.to_vec();
-            if let Some(output_token_ids) = tokens.output_token_ids {
-                combined.extend(output_token_ids.iter().copied().take(carried_output));
-            }
-            combined
-        });
+        let input_token_ids = tokens
+            .input_token_ids
+            .filter(|_| tokens.output_token_ids.is_some())
+            .map(|input_token_ids| {
+                let mut combined = input_token_ids.to_vec();
+                if let Some(output_token_ids) = tokens.output_token_ids {
+                    combined.extend(output_token_ids.iter().copied().take(carried_output));
+                }
+                combined
+            });
         let output_token_ids = tokens.output_token_ids.map(|output_token_ids| {
             output_token_ids
                 .iter()
@@ -289,6 +297,11 @@ impl PdDisaggregationSystem {
                 token_latency: combined_token_latency,
                 interval: original.sub_requests[0].interval(),
                 model: original.sub_requests[0].model().map(str::to_owned),
+                kv_prefix: original.sub_requests[0].kv_prefix().cloned(),
+                session_id: original.sub_requests[0].session_id().map(str::to_owned),
+                provider_tokens: original.sub_requests[0].provider_tokens().cloned(),
+                ttft_parts: None,
+                reused_tokens: None,
             }],
         })
     }
@@ -468,6 +481,7 @@ impl LogicalHandler for PdDisaggregationSystem {
             HandlerPayload::Event(SystemEvent::RequestCompleted { request, result }) => {
                 self.handle_child_completion(request, result, now, current, graph)
             }
+            HandlerPayload::Event(_) => bail!("unexpected external KV event in PD system"),
         }
     }
 }
@@ -614,6 +628,9 @@ mod tests {
                 model: None,
                 input_token_ids: Some((0..16).collect()),
                 output_token_ids: Some(vec![20, 21, 22]),
+                kv_prefix: None,
+                session_id: None,
+                provider_tokens: None,
             }],
         };
         let prefill = PdDisaggregationSystem::build_prefill_request(&original).unwrap();

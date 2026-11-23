@@ -60,6 +60,7 @@ def parse_request(row):
     if not isinstance(nodes, list) or not nodes:
         raise ValueError("sub_requests must be a non-empty list")
     row["initial"] = indices(row.get("initial"), len(nodes), "initial")
+    prefix_lengths = {}  # full identity length of each earlier call with one
     for index, node in enumerate(nodes):
         if not isinstance(node, dict) or node.get("kind") not in ("llm", "tool_call"):
             raise ValueError(f"sub-request {index}: expected llm or tool_call")
@@ -69,6 +70,9 @@ def parse_request(row):
         node["interval"] = number(
             0 if node.get("interval") is None else node["interval"], "interval"
         )
+        session_id = node.get("session_id")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise ValueError("session_id must be a non-empty string")
         if node["kind"] == "tool_call":
             node["duration"] = number(node.get("duration"), "duration")
             continue
@@ -80,6 +84,43 @@ def parse_request(row):
             )
         for value in latencies:
             number(value, "token_latency")
+        provider = node.get("provider_tokens")
+        if provider is not None:
+            if not isinstance(provider, dict) or set(provider) != {"prompt", "completion"}:
+                raise ValueError("provider_tokens requires prompt and completion")
+            for field in ("prompt", "completion"):
+                if integer(provider[field], f"provider_tokens.{field}") >= 2**32:
+                    raise ValueError("provider_tokens exceeds u32")
+        prefix = node.get("kv_prefix")
+        if prefix is not None:
+            required = {"namespace", "block_tokens", "block_ids"}
+            if not isinstance(prefix, dict) or not required <= set(prefix) <= required | {"parent", "shared"}:
+                raise ValueError("kv_prefix requires namespace, block_tokens and block_ids")
+            if not isinstance(prefix["namespace"], str) or not prefix["namespace"]:
+                raise ValueError("kv_prefix namespace must be non-empty")
+            block_tokens = integer(prefix["block_tokens"], "kv_prefix.block_tokens")
+            if not 0 < block_tokens < 2**32 or not isinstance(prefix["block_ids"], list):
+                raise ValueError("invalid kv_prefix block shape")
+            # The full list is the parent's first `shared` IDs, then block_ids.
+            shared = integer(prefix.get("shared", 0), "kv_prefix.shared")
+            if "parent" in prefix:
+                parent = integer(prefix["parent"], "kv_prefix.parent")
+                if parent not in prefix_lengths or parent >= index:
+                    raise ValueError("kv_prefix parent must be an earlier call with an identity")
+                if any(nodes[parent]["kv_prefix"][k] != prefix[k] for k in ("namespace", "block_tokens")):
+                    raise ValueError("kv_prefix parent must share namespace and block size")
+                if shared > prefix_lengths[parent]:
+                    raise ValueError("kv_prefix shares more than its parent's")
+            elif shared:
+                raise ValueError("shared kv_prefix identities need a parent")
+            prefix_lengths[index] = shared + len(prefix["block_ids"])
+            if prefix_lengths[index] * block_tokens > node["input_tokens"]:
+                raise ValueError("kv_prefix exceeds input_tokens")
+            for block in prefix["block_ids"]:
+                if integer(block, "kv_prefix.block_ids") >= 2**64:
+                    raise ValueError("kv_prefix block ID exceeds u64")
+            if node.get("input_token_ids") is not None:
+                raise ValueError("kv_prefix and input_token_ids are alternative identities")
         for field, count in (
             ("input_token_ids", "input_tokens"),
             ("output_token_ids", "output_tokens"),
@@ -196,6 +237,9 @@ def match_runs(reference, candidate):
                 "next",
                 "interval",
                 "duration",
+                "session_id",
+                "kv_prefix",
+                "provider_tokens",
             ):
                 if a.get(field) != b.get(field):
                     raise ValueError(f"{prefix}, sub-request {index}: {field} differs")

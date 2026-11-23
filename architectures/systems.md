@@ -80,6 +80,17 @@ has one scheduler for all ranks: request KV/state costs are averaged across
 ranks, and batch limits scale with `ep`. The second has one scheduler per rank,
 with raw per-device memory.
 
+External KV ownership treats a `single_instance` worker's GPUs as one KV domain:
+capacity and payloads are the per-device values, including replicated KV heads,
+times the TP size, and the per-device scheduler is charged their share. EP
+workers cannot accept external KV.
+
+The opt-in `cxl_pool` system owns a shared KV directory and original request
+DAGs. It assigns individual released LLM calls to existing worker systems,
+gates them on KV movement, and merges their timings into the original DAG.
+Host pressure, publication and reload use native graph events. See
+[CXL KV pool](cxl-pool.md).
+
 ## Evolution Rules
 
 - Build a new topology by composing systems through seeding and sinks before

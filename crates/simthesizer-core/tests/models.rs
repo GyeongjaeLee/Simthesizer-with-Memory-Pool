@@ -39,16 +39,17 @@ fn ep_scheduler_reserves_full_resident_weights_before_request_state() {
                     kv_tokens: 0,
                     input_token_ids: None,
                     output_token_ids: None,
+                    kv_prefix: None,
                 });
             }
             if fits {
-                assert_eq!(scheduler.schedule().unwrap().len(), 1);
+                assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
                 assert_eq!(scheduler.done_iteration(1.0).len(), 1);
-                assert_eq!(scheduler.schedule().unwrap().len(), 1);
+                assert_eq!(scheduler.schedule(0.0).unwrap().len(), 1);
                 assert_eq!(scheduler.done_iteration(2.0).len(), 1);
-                assert!(scheduler.schedule().unwrap().is_empty());
+                assert!(scheduler.schedule(0.0).unwrap().is_empty());
             } else {
-                assert!(scheduler.schedule().is_err());
+                assert!(scheduler.schedule(0.0).is_err());
             }
         }
     }

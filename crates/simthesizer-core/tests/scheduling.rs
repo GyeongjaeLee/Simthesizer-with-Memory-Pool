@@ -33,6 +33,7 @@ fn request(id: u64, input: u32, output: u32) -> ReadySubRequest {
         kv_tokens: 0,
         input_token_ids: None,
         output_token_ids: None,
+        kv_prefix: None,
     }
 }
 
@@ -47,7 +48,7 @@ fn token_budget_and_batch_limit_conserve_work_across_chunk_boundaries() {
             let mut total_q = 0;
             let mut completed = Vec::new();
             for tick in 1..=40 {
-                let batch = s.schedule().unwrap();
+                let batch = s.schedule(0.0).unwrap();
                 if batch.is_empty() {
                     break;
                 }
@@ -79,23 +80,23 @@ fn fixed_state_and_block_rounding_control_admission_and_release() {
     let mut s = scheduler(8, 2, 118, 10);
     s.enqueue_sub_request(request(0, 3, 1));
     s.enqueue_sub_request(request(1, 3, 1));
-    assert_eq!(s.schedule().unwrap().len(), 1);
+    assert_eq!(s.schedule(0.0).unwrap().len(), 1);
     assert_eq!(s.done_iteration(1.0)[0].request_id, 0);
-    assert_eq!(s.schedule().unwrap().len(), 1);
+    assert_eq!(s.schedule(0.0).unwrap().len(), 1);
     assert_eq!(s.done_iteration(2.0)[0].request_id, 1);
-    assert!(s.schedule().unwrap().is_empty());
+    assert!(s.schedule(0.0).unwrap().is_empty());
     let mut too_small = scheduler(8, 1, 117, 10);
     too_small.enqueue_sub_request(request(0, 3, 1));
-    assert!(too_small.schedule().is_err());
+    assert!(too_small.schedule(0.0).is_err());
 }
 
 #[test]
 fn an_iteration_cannot_be_scheduled_twice() {
     let mut s = scheduler(4, 1, 1000, 0);
     s.enqueue_sub_request(request(0, 4, 2));
-    assert_eq!(s.schedule().unwrap().len(), 1);
-    assert!(s.schedule().unwrap().is_empty());
+    assert_eq!(s.schedule(0.0).unwrap().len(), 1);
+    assert!(s.schedule(0.0).unwrap().is_empty());
     assert!(s.done_iteration(1.0).is_empty());
-    assert_eq!(s.schedule().unwrap()[0].q_len, 1);
+    assert_eq!(s.schedule(0.0).unwrap()[0].q_len, 1);
     assert_eq!(s.done_iteration(2.0)[0].token_latency, [1.0, 1.0]);
 }

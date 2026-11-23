@@ -327,3 +327,44 @@ fn pd_validates_the_original_request_before_splitting_it() {
         .add_request_arrival(input, &mut Graph::new(), None, None)
         .is_err());
 }
+
+/// One session: a call, a tool, then a call extending its prompt by one block,
+/// with the second identity listed in full or relative to the first call.
+fn extending_session(incremental: bool) -> Request {
+    let second = if incremental {
+        json!({"namespace":"n","block_tokens":4,"parent":0,"shared":3,"block_ids":[9]})
+    } else {
+        json!({"namespace":"n","block_tokens":4,"block_ids":[1,2,3,9]})
+    };
+    serde_json::from_value(
+        json!({"request_id":0,"arrival_time":0.0,"initial":[0],"sub_requests":[
+        {"kind":"llm","input_tokens":12,"output_tokens":2,"next":[1],
+         "kv_prefix":{"namespace":"n","block_tokens":4,"block_ids":[1,2,3]}},
+        {"kind":"tool_call","input_tokens":0,"output_tokens":0,"duration":1.0,"next":[2]},
+        {"kind":"llm","input_tokens":16,"output_tokens":1,"next":[],"kv_prefix":second}]}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn incremental_prefix_identity_reuses_like_the_full_list() {
+    for mut config in [single(), ep()] {
+        if config["kind"] == "single_instance" {
+            config["scheduler"]["enable_prefix_caching"] = json!(true);
+        } else {
+            for scheduler in config["schedulers"].as_array_mut().unwrap() {
+                scheduler["enable_prefix_caching"] = json!(true);
+            }
+        }
+        let run =
+            |incremental| run_system(config.clone(), &[extending_session(incremental)]).unwrap();
+        let ((full, full_end), (relative, relative_end)) = (run(false), run(true));
+        assert_eq!(latencies(&full, 0, 2), latencies(&relative, 0, 2));
+        close(full_end, relative_end);
+        // Results repeat each identity as the workload gave it.
+        let ResultSubRequest::Llm { kv_prefix, .. } = &relative[0].sub_requests[2] else {
+            unreachable!()
+        };
+        assert_eq!(kv_prefix.as_ref().unwrap().parent, Some(0));
+    }
+}

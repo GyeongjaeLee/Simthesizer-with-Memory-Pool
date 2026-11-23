@@ -31,12 +31,42 @@ successful simulation and flush; existing trace files are never replaced.
 | `running_requests` | Admitted, unfinished LLM sub-requests, including those retaining state outside the current batch |
 | `waiting_requests` | Enqueued sub-requests without admission, including preempted requests |
 | `generation_tokens_total` | Committed token emissions since scheduler creation |
+| `hbm_allocated_bytes` | Physical HBM occupancy, including weights, private allocation, cached blocks and externally owned reservations |
+| `prefix_cache_bytes` | Resident attention KV and recurrent checkpoints, including request-local opaque cache |
+| `preemptions_total` | Running requests returned to waiting after allocation failure |
+| `hbm_admission_waiting_requests` | Calls waiting for HBM capacity, including the FCFS suffix blocked behind them |
+| `kv_preparation_waiting_requests` | Enqueued calls blocked on external KV preparation |
+| `scheduler_waiting_requests` | Other enqueued calls outside the current batch |
+| `iteration_active` | A serving iteration is executing |
 
 An admission set keyed by completion node owns membership; its size gives the
 running count. Waiting is queue length minus that size. Admission, preemption,
 and completion update the set. Token generation increments at the emission
 site, including the final prefill chunk. Cached input and scheduled work do not
 increment it. Routing load snapshots retain their existing batch-based meaning.
+
+Wait gauges partition enqueued calls: an external HBM wait takes precedence
+over external KV preparation, which takes precedence over admission behind it
+and scheduler waiting. A call awaiting its KV lookup turn is a scheduler wait.
+CXL calls enqueue on release, so worker schedulers own all their wait phases and
+the parent exports none. Their preparation equals `ttft_parts.kv_load`; admission
+also counts calls queued behind an HBM wait, which `ttft_parts` counts as queue.
+Durations on individual CXL events can span multiple phases; use the gauges for
+disjoint totals.
+
+`python scripts/kv_metrics.py TRACE.jsonl --output METRICS.json` integrates
+snapshots until the final trace timestamp. Wait totals are request-seconds;
+concurrent requests can make them exceed elapsed time. `any_request_waiting_s`
+instead measures the union of waiting intervals. Neither quantity is GPU idle.
+
+`gpu_idle_s` measures intervals with no active serving iteration. An iteration
+includes its internal compute and collectives; this is serving-device idle,
+not per-kernel SM idle. A TP worker is one execution domain. Joint EP exposes
+system-level `iteration_active`, so an empty attention rank participating in
+expert execution does not become an idle GPU. Global idle is the union of
+intervals when every execution domain is idle, independent of waiting calls.
+The analyzer rejects missing phase gauges, ambiguous EP occupancy, changing
+component scopes, and invalid clocks. It never extrapolates beyond the trace.
 
 ## Composition and comparison
 

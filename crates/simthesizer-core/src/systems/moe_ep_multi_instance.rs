@@ -14,12 +14,14 @@ use crate::scheduler::Scheduler;
 use crate::system::{pending_llm_load, System, SystemEvent};
 use crate::types::{
     InstanceLoad, NodeID, ParallelStrategy, ReadySubRequest, Request, RequestResult,
-    ResultSubRequest, SubRequest, SubRequestCompletion,
+    ResultSubRequest, SubRequest, SubRequestCompletion, TtftParts,
 };
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MoeEpMultiInstanceSystem {
+    #[serde(skip)]
+    kv_capacity_event: Option<NodeID>,
     model_runner: Box<dyn ModelRunner>,
     model: Box<dyn Model>,
     schedulers: Vec<Box<dyn Scheduler>>,
@@ -91,6 +93,8 @@ enum LogicalPayload {
         subrequest_index: usize,
         completion_node_id: NodeID,
     },
+    LlmCapacityReady,
+    LlmPrepareSchedule,
     LlmSchedule,
     LlmBatchComplete,
     ToolCallRun {
@@ -205,6 +209,14 @@ impl MoeEpMultiInstanceSystem {
                         token_latency: completion.token_latency.clone(),
                         interval: *interval,
                         model: model.clone(),
+                        session_id: sub_request.session_id().map(str::to_owned),
+                        provider_tokens: sub_request.provider_tokens().cloned(),
+                        kv_prefix: sub_request.kv_prefix().cloned(),
+                        ttft_parts: TtftParts::scheduled(
+                            completion.token_latency.first().copied(),
+                            completion.queue_wait,
+                        ),
+                        reused_tokens: None,
                     },
                     SubRequest::ToolCall {
                         input_tokens,
@@ -212,12 +224,14 @@ impl MoeEpMultiInstanceSystem {
                         next,
                         duration,
                         interval,
+                        session_id,
                     } => ResultSubRequest::ToolCall {
                         input_tokens: *input_tokens,
                         output_tokens: *output_tokens,
                         next: next.clone(),
                         duration: duration.unwrap_or(0.0),
                         interval: *interval,
+                        session_id: session_id.clone(),
                     },
                 })
             })
@@ -302,6 +316,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                                 subrequest_index,
                                 completion_node_id,
                                 token_latency: Vec::new(),
+                                queue_wait: None,
                             },
                         )?;
                         let run = graph.add_logical_node(
@@ -361,6 +376,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     output_token_ids,
                     known_tokens,
                     kv_tokens,
+                    kv_prefix,
                 ) = {
                     let active = self
                         .active_requests
@@ -393,6 +409,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                         output_token_ids.clone(),
                         known_tokens,
                         kv_tokens,
+                        active.request.resolved_kv_prefix(subrequest_index),
                     )
                 };
                 self.schedulers[instance_index].enqueue_sub_request(ReadySubRequest {
@@ -406,7 +423,25 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     kv_tokens,
                     input_token_ids,
                     output_token_ids,
+                    kv_prefix,
                 });
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                graph.add_edge(current, schedule)?;
+                Ok(0.0)
+            }
+            LogicalPayload::LlmCapacityReady => {
+                if self.kv_capacity_event == Some(current) {
+                    self.kv_capacity_event = None;
+                }
+                Ok(0.0)
+            }
+            LogicalPayload::LlmPrepareSchedule => {
+                if let Some(capacity) = self.kv_capacity_event {
+                    let retry = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                    graph.add_edge(current, retry)?;
+                    graph.add_edge(capacity, retry)?;
+                    return Ok(0.0);
+                }
                 let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
                 graph.add_edge(current, schedule)?;
                 Ok(0.0)
@@ -419,7 +454,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 let mut instance_batches = Vec::with_capacity(self.schedulers.len());
                 let mut has_work = false;
                 for scheduler in &mut self.schedulers {
-                    let batch = scheduler.schedule()?;
+                    let batch = scheduler.schedule(now)?;
                     has_work |= !batch.is_empty();
                     instance_batches.push(batch);
                 }
@@ -436,6 +471,9 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 )?;
                 let complete = graph.add_logical_node(module, LogicalPayload::LlmBatchComplete);
                 graph.add_edge(last_node, complete)?;
+                let capacity = graph.add_logical_node(module, LogicalPayload::LlmCapacityReady);
+                graph.add_edge(complete, capacity)?;
+                self.kv_capacity_event = Some(capacity);
                 Ok(0.0)
             }
             LogicalPayload::LlmBatchComplete => {
@@ -450,8 +488,9 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                     graph.add_edge(current, completion_node_id)?;
                 }
 
-                let schedule = graph.add_logical_node(module, LogicalPayload::LlmSchedule);
-                graph.add_edge(current, schedule)?;
+                let capacity = self.kv_capacity_event.expect("active batch capacity fence");
+                let schedule = graph.add_logical_node(module, LogicalPayload::LlmPrepareSchedule);
+                graph.add_edge(capacity, schedule)?;
                 Ok(0.0)
             }
             LogicalPayload::ToolCallRun { duration } => Ok(duration),
@@ -462,6 +501,7 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
 impl Module for MoeEpMultiInstanceSystem {
     fn observe(&self) -> serde_json::Value {
         serde_json::json!({
+            "iteration_active": self.wave_running,
             "schedulers": self.schedulers.iter().map(|s| s.observe()).collect::<Vec<_>>()
         })
     }

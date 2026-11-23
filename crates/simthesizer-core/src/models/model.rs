@@ -4,6 +4,24 @@ use crate::module::Module;
 use crate::types::{Layer, ParallelStrategy};
 
 pub trait Model: Module {
+    /// Concrete architecture/layout identity; checkpoint identity belongs to the input namespace.
+    fn kv_compatibility(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::any::type_name::<Self>().hash(&mut hasher);
+        serde_json::to_string(&(
+            self.pre_block_layers(),
+            self.block_layers(),
+            self.post_block_layers(),
+            self.num_blocks(),
+            self.weight_bytes_per_device(),
+            self.kv_bytes_per_token_per_device(),
+            self.kv_bytes_per_request_per_device(),
+        ))
+        .expect("model geometry serializes")
+        .hash(&mut hasher);
+        hasher.finish()
+    }
     fn init(&mut self, parallel: ParallelStrategy) -> Result<()>;
     fn weight_bytes_per_device(&self) -> u64;
     fn kv_bytes_per_request_per_device(&self) -> u64 {

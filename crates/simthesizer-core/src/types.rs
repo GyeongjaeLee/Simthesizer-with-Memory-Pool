@@ -4,6 +4,32 @@ use serde::{Deserialize, Serialize};
 pub type NodeID = u64;
 pub type NetworkDeviceID = u64;
 
+/// Input-only identities supplied by a trace, never inferred from token counts.
+/// The full list is the first `shared` IDs of an earlier sub-request's full
+/// list (`parent`, in the same request) followed by `block_ids`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvPrefix {
+    pub namespace: String,
+    pub block_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shared: usize,
+    pub block_ids: Vec<u64>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTokens {
+    pub prompt: u32,
+    pub completion: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Layer {
     Embedding {
@@ -91,6 +117,26 @@ impl Request {
         self.sub_requests.iter().map(SubRequest::input_tokens).sum()
     }
 
+    /// Sub-request `index`'s full prefix identity, following `parent` references.
+    pub fn resolved_kv_prefix(&self, index: usize) -> Option<KvPrefix> {
+        let mut chain = vec![self.sub_requests[index].kv_prefix()?];
+        while let Some(parent) = chain.last().unwrap().parent {
+            chain.push(self.sub_requests[parent].kv_prefix()?);
+        }
+        let mut block_ids = Vec::new();
+        for prefix in chain.iter().rev() {
+            block_ids.truncate(prefix.shared);
+            block_ids.extend_from_slice(&prefix.block_ids);
+        }
+        Some(KvPrefix {
+            namespace: chain[0].namespace.clone(),
+            block_tokens: chain[0].block_tokens,
+            parent: None,
+            shared: 0,
+            block_ids,
+        })
+    }
+
     pub fn total_output_tokens(&self) -> u32 {
         self.sub_requests
             .iter()
@@ -107,7 +153,13 @@ impl Request {
             !self.sub_requests.is_empty(),
             "requests must contain at least one sub-request"
         );
+        // Full prefix identity lengths, known for earlier sub-requests.
+        let mut prefix_lengths = vec![None; self.sub_requests.len()];
         for (subrequest_index, sub_request) in self.sub_requests.iter().enumerate() {
+            ensure!(
+                sub_request.session_id().is_none_or(|id| !id.is_empty()),
+                "session_id must not be empty"
+            );
             for (name, value) in [
                 ("interval", sub_request.interval()),
                 ("duration", sub_request.duration()),
@@ -124,12 +176,69 @@ impl Request {
                 output_tokens,
                 known_tokens,
                 kv_tokens,
+                kv_prefix,
+                input_token_ids,
+                output_token_ids,
                 ..
             } = sub_request
             {
                 let total_tokens = input_tokens.checked_add(*output_tokens).ok_or_else(|| {
                     anyhow::anyhow!("llm sub-request {subrequest_index} token count exceeds u32")
                 })?;
+                for (name, ids, count) in [
+                    ("input_token_ids", input_token_ids, input_tokens),
+                    ("output_token_ids", output_token_ids, output_tokens),
+                ] {
+                    ensure!(
+                        ids.as_ref().is_none_or(|ids| ids.len() == *count as usize),
+                        "{name} length differs from token count"
+                    );
+                }
+                if let Some(prefix) = kv_prefix {
+                    ensure!(
+                        !prefix.namespace.is_empty(),
+                        "KV namespace must not be empty"
+                    );
+                    ensure!(
+                        prefix.block_tokens > 0,
+                        "KV identity block size must be positive"
+                    );
+                    ensure!(
+                        input_token_ids.is_none(),
+                        "choose token IDs or proxy KV identities"
+                    );
+                    let shared = match prefix.parent {
+                        Some(parent) => {
+                            let length = (parent < subrequest_index)
+                                .then(|| prefix_lengths[parent])
+                                .flatten()
+                                .ok_or_else(|| anyhow::anyhow!(
+                                    "llm sub-request {subrequest_index} KV parent must be an earlier LLM call with identities"
+                                ))?;
+                            let parent_prefix = self.sub_requests[parent].kv_prefix().unwrap();
+                            ensure!(
+                                parent_prefix.namespace == prefix.namespace
+                                    && parent_prefix.block_tokens == prefix.block_tokens,
+                                "KV parent must share namespace and block size"
+                            );
+                            ensure!(
+                                prefix.shared <= length,
+                                "KV identities share more than the parent's"
+                            );
+                            prefix.shared
+                        }
+                        None => {
+                            ensure!(prefix.shared == 0, "shared KV identities need a parent");
+                            0
+                        }
+                    };
+                    let length = shared + prefix.block_ids.len();
+                    ensure!(
+                        length as u64 * u64::from(prefix.block_tokens) <= u64::from(*input_tokens),
+                        "KV identities exceed the input length"
+                    );
+                    prefix_lengths[subrequest_index] = Some(length);
+                }
                 match (known_tokens, kv_tokens) {
                     (Some(known_tokens), Some(kv_tokens)) => {
                         ensure!(
@@ -179,6 +288,9 @@ pub enum SubRequest {
         model: Option<String>,
         input_token_ids: Option<Vec<u32>>,
         output_token_ids: Option<Vec<u32>>,
+        kv_prefix: Option<KvPrefix>,
+        session_id: Option<String>,
+        provider_tokens: Option<ProviderTokens>,
     },
     ToolCall {
         input_tokens: u32,
@@ -186,10 +298,35 @@ pub enum SubRequest {
         next: Vec<usize>,
         duration: Option<f64>,
         interval: Option<f64>,
+        session_id: Option<String>,
     },
 }
 
 impl SubRequest {
+    pub fn kv_prefix(&self) -> Option<&KvPrefix> {
+        match self {
+            Self::Llm { kv_prefix, .. } => kv_prefix.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Llm { session_id, .. } | Self::ToolCall { session_id, .. } => {
+                session_id.as_deref()
+            }
+        }
+    }
+
+    pub fn provider_tokens(&self) -> Option<&ProviderTokens> {
+        match self {
+            Self::Llm {
+                provider_tokens, ..
+            } => provider_tokens.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn kind(&self) -> SubRequestKind {
         match self {
             Self::Llm { .. } => SubRequestKind::Llm,
@@ -282,6 +419,7 @@ pub struct ReadySubRequest {
     pub kv_tokens: u32,
     pub input_token_ids: Option<Vec<u32>>,
     pub output_token_ids: Option<Vec<u32>>,
+    pub kv_prefix: Option<KvPrefix>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -290,6 +428,36 @@ pub struct SubRequestCompletion {
     pub subrequest_index: usize,
     pub completion_node_id: NodeID,
     pub token_latency: Vec<f64>,
+    /// Time from enqueue to the first iteration that included the call.
+    pub queue_wait: Option<f64>,
+}
+
+/// Where an LLM call's time to first token went, in seconds; the parts sum
+/// to the first `token_latency` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TtftParts {
+    /// Waiting for KV reloads.
+    pub kv_load: f64,
+    /// Waiting for HBM to hold the reloaded prefix.
+    pub admission: f64,
+    /// In the worker's queue before its first iteration.
+    pub queue: f64,
+    /// From the first iteration to the first token, including iterations
+    /// shared with other calls.
+    pub prefill: f64,
+}
+
+impl TtftParts {
+    /// Scheduler-side parts of a call's first token latency.
+    pub fn scheduled(ttft: Option<f64>, queue_wait: Option<f64>) -> Option<Self> {
+        let (ttft, queue) = (ttft?, queue_wait?);
+        Some(Self {
+            kv_load: 0.0,
+            admission: 0.0,
+            queue,
+            prefill: ttft - queue,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +518,17 @@ pub enum ResultSubRequest {
         token_latency: Vec<f64>,
         interval: Option<f64>,
         model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_tokens: Option<ProviderTokens>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_prefix: Option<KvPrefix>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttft_parts: Option<TtftParts>,
+        /// Prompt tokens restored from cached KV instead of prefilled.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reused_tokens: Option<u32>,
     },
     ToolCall {
         input_tokens: u32,
@@ -357,6 +536,8 @@ pub enum ResultSubRequest {
         next: Vec<usize>,
         duration: f64,
         interval: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
 }
 
