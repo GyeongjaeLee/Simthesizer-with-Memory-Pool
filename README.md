@@ -54,6 +54,8 @@ cargo run --release -- \
 > No GPU needed. Output keeps the input DAG and adds per-token latency to each
 > LLM call.
 
+CXL memory pool experiments: [quick start](docs/docs/getting-started/cxl-experiments.md#quick-start).
+
 ## 🎯 Profile and validate
 
 ```bash

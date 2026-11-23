@@ -8,7 +8,8 @@ output is per-token timing for every LLM call, in the same DAG shape.
 
 The implemented product is a Rust CLI that reads one scenario config and one
 canonical workload JSONL and writes one result JSONL. Compute cost comes from
-per-layer latency tables profiled with vLLM on real hardware; communication
+per-layer latency tables profiled with vLLM on real hardware or whole-iteration
+forward-pass tables measured on a serving deployment; communication
 cost comes from a flow-level network model. `scripts/baseline.py` replays
 single-call workloads on vLLM for comparison. `scripts/compare.py` measures
 serving-metric errors; `scripts/draw.py` plots latency and throughput.
@@ -61,8 +62,9 @@ own all serving semantics and reach the engine only through graph nodes.
 - A `System` owns request lifecycle: seeding request DAGs, splicing in work,
   completion accounting, and composition into multi-instance and disaggregated
   topologies; see [serving systems](architectures/systems.md).
-- A `Scheduler` owns ready LLM work, batch admission, KV memory, and its
-  prefix cache. A `Router` owns whole-request placement; see
+- A `Scheduler` owns ready LLM work, FCFS admission, incremental KV allocation,
+  preemption and its local prefix cache. An external KV parent owns shared
+  content, replicas and transfer dependencies. A `Router` owns placement; see
   [scheduling](architectures/scheduling.md).
 - A `Model` owns the layer plan and memory footprint for a parallel strategy.
   A `ModelRunner` owns one parallelism axis and expands a batch into compute
@@ -73,13 +75,27 @@ own all serving semantics and reach the engine only through graph nodes.
   [cost models](architectures/cost-models.md).
 - `scripts/profile.py` measures vLLM components and preserves exact batch shapes
   in JSONL; see [profiling](architectures/profiling.md).
+- `scripts/import_fpm.py` normalizes public forward-pass measurements (FPM) of one
+  deployment; see [cost models](architectures/cost-models.md).
 - `scripts/baseline.py` replays single-call workloads and records client-visible
   token timings; see [validation](architectures/validation.md).
 - `scripts/results.py` owns result validation, DAG timing reconstruction, and
   serving metrics shared by comparison and plotting. Analysis never enters the
   simulation path; see [validation](architectures/validation.md).
+- `scripts/freeinference.py` preserves provider-count workloads or emits
+  namespaced proxy-prefix input from original full source blocks. Dataset
+  conversion does not infer KV identity from token counts or session membership.
 - Components expose read-only state; the engine supplies observation times and
-  the CLI writes optional JSONL traces. See [observability](architectures/observability.md).
+  the CLI writes optional JSONL traces. Admission, KV preparation and scheduler
+  waits are disjoint; serving idle derives separately from execution intervals.
+  See [observability](architectures/observability.md).
+
+KV identity is independent of ownership and storage location. Completed calls
+release execution references while unreferenced cached content remains reclaimable.
+Hybrid reuse additionally requires a counted recurrent-state checkpoint. The
+optional HBM → host → CXL backing hierarchy is a Simthesizer extension; asynchronous
+storage and HBM reclamation are separate operations, with reservations and copy
+lifetimes charged to their actual tiers. See [CXL KV pool](architectures/cxl-pool.md).
 
 Detailed contracts:
 
@@ -94,6 +110,8 @@ Detailed contracts:
 - [Validation](architectures/validation.md)
 - [Observability](architectures/observability.md)
 - [Agent workflow](architectures/agent-workflow.md)
+- [CXL physical topology](architectures/cxl-topology.md)
+- [CXL KV pool](architectures/cxl-pool.md)
 
 ## Simulation Flow
 
@@ -115,7 +133,9 @@ loads. Routed children enter the graph beneath that arrival event.
 
 - Workload JSONL is the only input format: one request DAG per row. Each LLM
   sub-request carries its own full context; runtime never reconstructs context
-  from predecessors.
+  from predecessors' execution. Optional token traces or namespaced full-block
+  identities prove reusable input; a block identity list may extend an earlier
+  call's list in the same row. Generated KV does not implicitly identify a later input.
 - Result JSONL repeats the input DAG and adds one `token_latency` array per LLM
   sub-request: TTFT first, then inter-token latencies.
 - A scenario is one TOML tree whose `kind` fields select registered
@@ -141,18 +161,24 @@ loads. Routed children enter the graph beneath that arrival event.
 crates/simthesizer-core/   engine, component traits, registries, built-ins
 crates/simthesizer-cli/    `simthesizer` binary: config, workload, result IO
 scripts/profile.py        standalone vLLM component profiler
+scripts/import_fpm.py     public forward-pass table importer
 scripts/baseline.py       standalone vLLM workload replay
 scripts/results.py        shared result analysis
+scripts/freeinference.py  provider-count and proxy-prefix workload conversion
+scripts/kv_metrics.py     disjoint wait and serving-idle trace analysis
 scripts/compare.py        serving-metric error reports
 scripts/draw.py           latency and throughput figures
 tools/                    agent workflow and validation tools
 pyproject.toml           Python dependencies and dependency groups
 uv.lock                  locked Python dependency versions
 devenv.nix               Rust, Python/uv, and CUDA environments
+Dockerfile               CPU-only Rust, uv, and Python container
 examples/profiles/        profiling receipts
 examples/data/<device>/   profiles grouped by GPU model
 examples/scenarios/       named simulator and baseline configurations
 examples/workloads/       canonical workload JSONL
+experiments/cxl-pool/     CXL pool scenario generator, rate sweeps, figures
+experiments/fpm-validation/  forward-pass table validation
 architectures/             component architecture documents
 .agents/skills/            agent skills shipped with the repository
 ```
@@ -161,6 +187,10 @@ architectures/             component architecture documents
 initialization. The CLI depends on the core, never the reverse.
 
 `scripts/` contains commands for human use; `tools/` contains agent-facing tools.
+
+Keep reusable examples under version control and run artifacts under `output/`.
+Architecture documents own component contracts; tests own regression fixtures.
+Avoid per-task copies of those facts and parallel validation frameworks.
 
 ## Evolution Rules
 

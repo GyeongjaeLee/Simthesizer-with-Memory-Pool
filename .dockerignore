@@ -1,0 +1,2 @@
+# The image holds only toolchains; the repository is mounted at run time.
+*

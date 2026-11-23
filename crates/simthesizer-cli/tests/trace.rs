@@ -101,3 +101,105 @@ fn malformed_request_semantics_fail_without_publishing_outputs() {
         assert!(!trace.exists());
     }
 }
+
+#[test]
+fn trace_times_keep_the_first_frame_at_or_after_each_time() {
+    let root = tempfile::tempdir().unwrap();
+    let workload = root.path().join("workload.jsonl");
+    let request = json!({"request_id":0,"arrival_time":1.0,"initial":[0],
+        "sub_requests":[{"kind":"llm","input_tokens":8,"output_tokens":4,"next":[]}]});
+    std::fs::write(&workload, format!("{request}\n")).unwrap();
+    let frames = |path: &Path| -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let full = root.path().join("full.jsonl");
+    assert!(run(&workload, &root.path().join("a.jsonl"), Some(&full))
+        .status
+        .success());
+    let all = frames(&full);
+    let at = all[2]["time_s"].as_f64().unwrap();
+    let sparse = root.path().join("sparse.jsonl");
+    let output = run_with(
+        &workload,
+        &root.path().join("b.jsonl"),
+        &sparse,
+        &["0.5", &at.to_string()],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first_after = |t: f64| {
+        all.iter()
+            .find(|f| f["time_s"].as_f64().unwrap() >= t)
+            .unwrap()
+    };
+    assert_eq!(
+        frames(&sparse),
+        vec![first_after(0.5).clone(), first_after(at).clone()]
+    );
+}
+
+fn run_with(workload: &Path, result: &Path, trace: &Path, times: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_simthesizer"))
+        .arg("--config")
+        .arg(config())
+        .arg("--workload")
+        .arg(workload)
+        .arg("--output-jsonl")
+        .arg(result)
+        .arg("--output-engine-trace")
+        .arg(trace)
+        .arg("--trace-times")
+        .args(times)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn saturation_stops_an_overloaded_run_but_not_a_light_one() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |name: &str, count: u64, gap: f64| {
+        let workload = root.path().join(format!("{name}.jsonl"));
+        let rows: String = (0..count)
+            .map(|id| {
+                format!(
+                    "{}\n",
+                    json!({"request_id":id,"arrival_time":id as f64 * gap,"initial":[0],
+                        "sub_requests":[{"kind":"llm","input_tokens":2000,"output_tokens":64,"next":[]}]})
+                )
+            })
+            .collect();
+        std::fs::write(&workload, rows).unwrap();
+        let result = root.path().join(format!("{name}-results.jsonl"));
+        let output = Command::new(env!("CARGO_BIN_EXE_simthesizer"))
+            .arg("--config")
+            .arg(config())
+            .arg("--workload")
+            .arg(&workload)
+            .arg("--output-jsonl")
+            .arg(&result)
+            .args(["--saturation-wait", "0.25"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (status, result.exists())
+    };
+    let (status, written) = run("overloaded", 1000, 0.005);
+    assert_eq!(status["status"], "saturated");
+    assert!(status["mean_wait_s"].as_f64().unwrap() > 0.25);
+    assert!(!written);
+    let (status, written) = run("light", 10, 1.0);
+    assert_eq!(status, json!({"status": "complete"}));
+    assert!(written);
+}

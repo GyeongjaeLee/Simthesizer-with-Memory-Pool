@@ -7,7 +7,11 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Getting started',
       collapsed: false,
-      items: ['getting-started/installation', 'getting-started/quickstart'],
+      items: [
+        'getting-started/installation',
+        'getting-started/quickstart',
+        'getting-started/cxl-experiments',
+      ],
     },
     {
       type: 'category',

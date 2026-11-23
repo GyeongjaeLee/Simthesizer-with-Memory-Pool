@@ -43,3 +43,17 @@ supplies Rust, Python, and uv:
 devenv shell                    # simulation and analysis
 devenv --profile vllm shell     # adds vLLM, CUDA build tools, and driver libraries
 ```
+
+## Docker (optional)
+
+The `Dockerfile` supplies Rust, uv and Python 3.14 for simulation and
+analysis; it needs no GPU. The repository is mounted, not copied:
+
+```bash
+docker build -t simthesizer .
+docker run --rm -it -v "$PWD":/work simthesizer
+# inside: cargo build --release && uv sync --locked
+```
+
+On Linux, files the container creates belong to root; in the container,
+`chown -R "$(stat -c %u:%g /work)" /work` returns them to you.
